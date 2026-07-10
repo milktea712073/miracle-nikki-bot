@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and Conda
+.venv/
+venv/
+env/
+.env
+.conda/
+
+# IDEs and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local data and secrets
+*.sqlite3
+*.db
+*.log
+secrets.*
+
+# Local workspace files
+work/
