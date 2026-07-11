@@ -47,10 +47,13 @@ async def latest(ctx: commands.Context[commands.Bot]) -> None:
         ),
         color=discord.Color.from_rgb(255, 183, 197),
     )
-    if post["image_url"]:
-        embed.set_image(url=post["image_url"])
+    if post["image_urls"]:
+        embed.set_image(url=post["image_urls"][0])
 
     await ctx.send(embed=embed)
+
+    for image in post["image_urls"][1:]:
+        await ctx.send(image)
 
 
 def main() -> None:

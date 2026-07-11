@@ -98,10 +98,20 @@ def get_post_url(article: Locator) -> str:
     return urlunsplit((post_url.scheme, post_url.netloc, post_url.path, "", ""))
 
 
-def get_image_url(article: Locator) -> str | None:
-    """Get the first image associated with the post, if the post has one."""
-    image = article.locator("img[src*='scontent']").first
-    return image.get_attribute("src") if image.count() else None
+def get_image_urls(article: Locator) -> list[str]:
+    images = article.locator("img[src*='scontent']")
+
+    urls = []
+
+    for i in range(images.count()):
+        image = images.nth(i)
+
+        url = image.get_attribute("src")
+
+        if url:
+            urls.append(url)
+
+    return urls
 
 
 def expand_post_content(article: Locator) -> bool:
@@ -181,11 +191,11 @@ def fetch_latest_post() -> dict[str, str | None]:
             detail_article = open_post_detail(page, post_url)
             content = get_full_post_content(detail_article)
             publish_time = get_publish_time(page)
-            image_url = get_image_url(detail_article)
+            image_urls = get_image_urls(detail_article)
             return {
                 "publish_time": publish_time,
                 "content": content,
-                "image_url": image_url,
+                "image_urls": image_urls,
                 "post_url": post_url,
             }
         finally:
@@ -200,7 +210,7 @@ def main() -> None:
     print("======== \u6700\u65b0\u8cbc\u6587 ========")
     print(f"\u767c\u5e03\u65e5\u671f\uff1a\n{post['publish_time']}")
     print(f"\n\u8cbc\u6587\u5167\u5bb9\uff1a\n{post['content']}")
-    print(f"\n\u5716\u7247\u7db2\u5740\uff1a\n{post['image_url']}")
+    print(f"\n\u5716\u7247\u7db2\u5740\uff1a\n{post['image_urls']}")
     print(f"\n\u8cbc\u6587\u7db2\u5740\uff1a\n{post['post_url']}")
     print("==========================")
 
