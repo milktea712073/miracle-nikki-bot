@@ -42,7 +42,7 @@ async def latest(ctx: commands.Context[commands.Bot]) -> None:
     embed = discord.Embed(
         title="\U0001f338 \u5947\u8e5f\u6696\u6696\u6700\u65b0\u516c\u544a",
         description=(
-            f"\U0001f4c5 \u767c\u5e03\u6642\u9593\n{post['time']}\n\n"
+            f"\U0001f4c5 \u767c\u5e03\u65e5\u671f\n{post['publish_time']}\n\n"
             f"\U0001f4dd \u516c\u544a\u5167\u5bb9\n{post['content']}"
         ),
         color=discord.Color.from_rgb(255, 183, 197),

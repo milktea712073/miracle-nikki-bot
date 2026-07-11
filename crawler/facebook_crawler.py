@@ -2,14 +2,17 @@
 
 import re
 import sys
+from datetime import datetime
 from typing import Final
 from urllib.parse import urljoin, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 FACEBOOK_PAGE_URL: Final = "https://www.facebook.com/TwNikkiNikki"
 PAGE_TIMEOUT_MS: Final = 60_000
+DISPLAY_TIMEZONE: Final = ZoneInfo("Asia/Taipei")
 POST_LINK_SELECTOR: Final = (
     "a[href*='/posts/'], a[href*='/videos/'], a[href*='/permalink/'], "
     "a[href*='/reel/']"
@@ -47,16 +50,42 @@ def get_post_article(page: Page) -> Locator:
     raise RuntimeError("Facebook page loaded, but no post article was found.")
 
 
-def get_post_time(article: Locator) -> str:
-    """Get the visible publication time from the post permalink."""
-    links = article.locator(POST_LINK_SELECTOR)
-    for index in range(links.count()):
-        text = links.nth(index).inner_text().strip()
-        if text:
-            return text
+def format_publish_time(timestamp: int) -> str:
+    """Format a Unix timestamp for the bot's Taiwan audience."""
+    return datetime.fromtimestamp(timestamp, DISPLAY_TIMEZONE).strftime("%Y/%m/%d %H:%M")
 
-    time_element = article.locator("time, abbr").first
-    return time_element.inner_text().strip() if time_element.count() else ""
+
+def get_publish_time(page: Page) -> str:
+    """Extract an absolute publication time from the post detail page."""
+    time_elements = page.locator("time[datetime]")
+    for index in range(time_elements.count()):
+        value = time_elements.nth(index).get_attribute("datetime")
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=DISPLAY_TIMEZONE)
+        return parsed.astimezone(DISPLAY_TIMEZONE).strftime("%Y/%m/%d %H:%M")
+
+    unix_time_elements = page.locator("[data-utime], [data-timestamp]")
+    for index in range(unix_time_elements.count()):
+        value = unix_time_elements.nth(index).get_attribute("data-utime")
+        value = value or unix_time_elements.nth(index).get_attribute("data-timestamp")
+        if value and value.isdigit():
+            return format_publish_time(int(value))
+
+    page_data = page.content()
+    timestamp = re.search(r'"(?:publish_time|creation_time)":(\d{10})', page_data)
+    if timestamp:
+        return format_publish_time(int(timestamp.group(1)))
+
+    raise RuntimeError(
+        "Facebook did not expose an absolute publication time. "
+        "Use a persistent Playwright context with a logged-in Facebook session."
+    )
 
 
 def get_post_url(article: Locator) -> str:
@@ -71,7 +100,7 @@ def get_post_url(article: Locator) -> str:
 
 def get_image_url(article: Locator) -> str | None:
     """Get the first image associated with the post, if the post has one."""
-    image = article.locator("img[src*='scontent.']").first
+    image = article.locator("img[src*='scontent']").first
     return image.get_attribute("src") if image.count() else None
 
 
@@ -103,8 +132,8 @@ def dismiss_cookie_dialog(page: Page) -> None:
         buttons.first.click(timeout=5_000)
 
 
-def get_full_post_content(page: Page, post_url: str) -> str:
-    """Open a post permalink and return its full message text."""
+def open_post_detail(page: Page, post_url: str) -> Locator:
+    """Open a post permalink and return its article from the detail page."""
     page.goto(post_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     dismiss_cookie_dialog(page)
 
@@ -112,8 +141,11 @@ def get_full_post_content(page: Page, post_url: str) -> str:
         "[data-ad-preview='message'], [data-ad-comet-preview='message']"
     ).first
     message.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+    return get_post_article(page)
 
-    article = get_post_article(page)
+
+def get_full_post_content(article: Locator) -> str:
+    """Return the full message text from a post detail article."""
     expanded = expand_post_content(article)
     content = first_text(article, MESSAGE_SELECTORS)
     if content and not content.endswith(("\u67e5\u770b\u66f4\u591a", "See more")):
@@ -146,11 +178,12 @@ def fetch_latest_post() -> dict[str, str | None]:
 
             article = get_post_article(page)
             post_url = get_post_url(article)
-            post_time = get_post_time(article)
-            image_url = get_image_url(article)
-            content = get_full_post_content(page, post_url)
+            detail_article = open_post_detail(page, post_url)
+            content = get_full_post_content(detail_article)
+            publish_time = get_publish_time(page)
+            image_url = get_image_url(detail_article)
             return {
-                "time": post_time,
+                "publish_time": publish_time,
                 "content": content,
                 "image_url": image_url,
                 "post_url": post_url,
@@ -165,7 +198,7 @@ def main() -> None:
     post = fetch_latest_post()
 
     print("======== \u6700\u65b0\u8cbc\u6587 ========")
-    print(f"\u767c\u6587\u6642\u9593\uff1a\n{post['time']}")
+    print(f"\u767c\u5e03\u65e5\u671f\uff1a\n{post['publish_time']}")
     print(f"\n\u8cbc\u6587\u5167\u5bb9\uff1a\n{post['content']}")
     print(f"\n\u5716\u7247\u7db2\u5740\uff1a\n{post['image_url']}")
     print(f"\n\u8cbc\u6587\u7db2\u5740\uff1a\n{post['post_url']}")
