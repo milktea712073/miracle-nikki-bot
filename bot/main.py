@@ -18,7 +18,12 @@ from database.database import (
     announcement_exists,
     insert_announcement,
 )
-
+from database.database import (
+    get_connection,
+    announcement_exists,
+    insert_announcement,
+    insert_images,   # ← 新增
+)
 
 def load_dotenv(path: Path) -> None:
     """Load simple KEY=VALUE entries from a local .env file."""
@@ -86,11 +91,17 @@ async def check_new_post():
         conn.close()
         return
 
-    insert_announcement(
+    announcement_id = insert_announcement(
         conn,
         post["publish_time"],
         post["content"],
         post["post_url"],
+    )
+
+    insert_images(
+    conn,
+    announcement_id,
+    post["image_urls"],
     )
     print("🎉 發現新公告")
 

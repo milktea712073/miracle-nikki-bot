@@ -27,6 +27,18 @@ def insert_announcement(conn, publish_time, content, post_url):
     """, (publish_time, content, post_url))
 
     conn.commit()
+    return cursor.lastrowid
+
+def insert_images(conn, announcement_id, image_urls):
+    cursor = conn.cursor()
+
+    for image_url in image_urls:
+        cursor.execute("""
+        INSERT INTO images (announcement_id, image_url)
+        VALUES (?, ?)
+        """, (announcement_id, image_url))
+
+    conn.commit()
 
 def get_connection():
     return sqlite3.connect("database/database.db")
