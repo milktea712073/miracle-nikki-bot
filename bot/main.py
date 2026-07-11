@@ -32,6 +32,28 @@ def load_dotenv(path: Path) -> None:
         key, value = line.split("=", maxsplit=1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
+def create_embed(post):
+    embed = discord.Embed(
+        title="🌸 奇蹟暖暖最新公告",
+        description=(
+            f"📅 發布日期\n{post['publish_time']}\n\n"
+            f"📝 公告內容\n{post['content']}"
+        ),
+        color=discord.Color.from_rgb(255, 183, 197),
+    )
+
+    if post["image_urls"]:
+        embed.set_image(url=post["image_urls"][0])
+
+    return embed
+
+async def send_post(destination, post):
+    embed = create_embed(post)
+
+    await destination.send(embed=embed)
+
+    for image in post["image_urls"][1:]:
+        await destination.send(image)
 
 load_dotenv(PROJECT_ROOT / ".env")
 CHANNEL_IDS = [
@@ -50,7 +72,6 @@ async def on_ready():
 
     if not check_new_post.is_running():
         check_new_post.start()
-
 
 @tasks.loop(minutes=5)
 async def check_new_post():
@@ -75,48 +96,20 @@ async def check_new_post():
 
     conn.close()
 
-    embed = discord.Embed(
-        title="🌸 奇蹟暖暖最新公告",
-        description=(
-            f"📅 發布日期\n{post['publish_time']}\n\n"
-            f"📝 公告內容\n{post['content']}"
-        ),
-        color=discord.Color.from_rgb(255, 183, 197),
-    )
-
-    if post["image_urls"]:
-        embed.set_image(url=post["image_urls"][0])
-    
     for channel_id in CHANNEL_IDS:
         channel = bot.get_channel(channel_id)
 
         if channel is None:
             continue
 
-        await channel.send(embed=embed)
-
-        for image in post["image_urls"][1:]:
-            await channel.send(image)
+        await send_post(channel, post)
 
 @bot.command(name="latest")
 async def latest(ctx: commands.Context[commands.Bot]) -> None:
     """Reply with the latest official Facebook post."""
     post = await asyncio.to_thread(fetch_latest_post)
-    embed = discord.Embed(
-        title="\U0001f338 \u5947\u8e5f\u6696\u6696\u6700\u65b0\u516c\u544a",
-        description=(
-            f"\U0001f4c5 \u767c\u5e03\u65e5\u671f\n{post['publish_time']}\n\n"
-            f"\U0001f4dd \u516c\u544a\u5167\u5bb9\n{post['content']}"
-        ),
-        color=discord.Color.from_rgb(255, 183, 197),
-    )
-    if post["image_urls"]:
-        embed.set_image(url=post["image_urls"][0])
 
-    await ctx.send(embed=embed)
-
-    for image in post["image_urls"][1:]:
-        await ctx.send(image)
+    await send_post(ctx, post)
 
 
 def main() -> None:
