@@ -7,6 +7,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from crawler.facebook_crawler import fetch_latest_post
 
+def announcement_exists(conn, post_url):
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    SELECT id
+    FROM announcements
+    WHERE post_url = ?
+    """, (post_url,))
+
+    return cursor.fetchone() is not None
+
 def insert_announcement(conn, publish_time, content, post_url):
     cursor = conn.cursor()
 
@@ -17,30 +28,36 @@ def insert_announcement(conn, publish_time, content, post_url):
 
     conn.commit()
 
+def get_connection():
+    return sqlite3.connect("database/database.db")
 
-conn = sqlite3.connect("database/database.db")
+def init_database():
+    conn = get_connection()
 
-cursor = conn.cursor()
+    cursor = conn.cursor()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS announcements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    publish_time TEXT NOT NULL,
-    content TEXT NOT NULL,
-    post_url TEXT UNIQUE NOT NULL
-)
-""")
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS announcements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        publish_time TEXT NOT NULL,
+        content TEXT NOT NULL,
+        post_url TEXT UNIQUE NOT NULL
+    )
+    """)
 
-conn.commit()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS images (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        announcement_id INTEGER NOT NULL,
+        image_url TEXT NOT NULL,
+        FOREIGN KEY (announcement_id) REFERENCES announcements(id)
+    )
+    """)
 
-print("announcements 建立成功")
+    conn.commit()
 
-post = fetch_latest_post()
-insert_announcement(
-    conn,
-    post["publish_time"],
-    post["content"],
-    post["post_url"],
-)
+    print("資料庫初始化完成")
+    conn.close()
 
-conn.close()
+if __name__ == "__main__":
+    init_database()
