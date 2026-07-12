@@ -58,10 +58,19 @@ class EventAdminView(discord.ui.View):
         if context is None:
             await interaction.response.send_message("找不到活動資料。", ephemeral=True)
             return
-        session = EventEditSession(interaction.guild_id, interaction.channel_id, interaction.message.id, self.event_id, interaction.user.id)
-        view = EventEditMenuView(session)
-        await interaction.response.send_message(embed=menu_embed(context.name), view=view, ephemeral=True)
-        view.message = await interaction.original_response()
+        suit_names = await asyncio.to_thread(
+            KnowledgeQueryRepository().get_event_suit_names, self.event_id
+        )
+        session = EventEditSession(
+            interaction.guild_id,
+            interaction.channel_id,
+            interaction.message.id,
+            self.event_id,
+            interaction.user.id,
+        )
+        await interaction.response.send_modal(
+            EventInfoModal(context, suit_names, session, None)
+        )
 
     @discord.ui.button(label="✅ 標記已確認", style=discord.ButtonStyle.success)
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -87,7 +96,12 @@ class EventEditMenuView(discord.ui.View):
         if context is None:
             await interaction.response.send_message("找不到活動資料。", ephemeral=True)
             return
-        await interaction.response.send_modal(EventInfoModal(context, self.session, self.message))
+        suit_names = await asyncio.to_thread(
+            KnowledgeQueryRepository().get_event_suit_names, self.session.event_id
+        )
+        await interaction.response.send_modal(
+            EventInfoModal(context, suit_names, self.session, self.message)
+        )
 
     @discord.ui.button(label="2️⃣ 完成編輯", style=discord.ButtonStyle.success)
     async def complete(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -157,19 +171,45 @@ class SuitMenuView(discord.ui.View):
 
 
 class EventInfoModal(discord.ui.Modal):
-    def __init__(self, context: EventEditContext, session: EventEditSession, menu_message: discord.Message | None) -> None:
+    def __init__(
+        self,
+        context: EventEditContext,
+        suit_names: list[str],
+        session: EventEditSession,
+        menu_message: discord.Message | None,
+    ) -> None:
         self.context, self.session, self.menu_message = context, session, menu_message
         super().__init__(title="活動資訊")
-        self.category = discord.ui.TextInput(label="活動分類", default=context.event_type_name or "", placeholder="例如：扭蛋")
+        self.category = discord.ui.TextInput(label="活動分類", default=context.event_type_name or "", placeholder="例如：扭蛋" ,required=False,)
         self.start = discord.ui.TextInput(label="開始（YYYY-MM-DD HH:mm）", default=format_edit_time(context.start_at))
         self.end = discord.ui.TextInput(label="結束（YYYY-MM-DD HH:mm）", default=format_edit_time(context.end_at))
         self.notes = discord.ui.TextInput(label="備註（可選）", default=context.notes or "", required=False, style=discord.TextStyle.paragraph)
-        for item in (self.category, self.start, self.end, self.notes):
+        self.suits = discord.ui.TextInput(
+            label="套裝名稱",
+            default=", ".join(suit_names)[:4_000],
+            placeholder="以逗號分隔套裝名稱",
+            required=False,
+            max_length=4_000,
+        )
+        for item in (self.category, self.start, self.end, self.notes, self.suits):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
-            await asyncio.to_thread(KnowledgeQueryRepository().save_event_info, self.session.event_id, str(self.category.value), str(self.start.value), str(self.end.value), str(self.notes.value) or None)
+            repository = KnowledgeQueryRepository()
+            await asyncio.to_thread(
+                repository.save_event_info,
+                self.session.event_id,
+                str(self.category.value),
+                str(self.start.value),
+                str(self.end.value),
+                str(self.notes.value) or None,
+            )
+            await asyncio.to_thread(
+                repository.synchronize_event_suits,
+                self.session.event_id,
+                str(self.suits.value).replace("，", ",").split(","),
+            )
         except ValueError as error:
             await interaction.response.send_message(str(error), ephemeral=True)
             return

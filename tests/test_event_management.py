@@ -1,13 +1,20 @@
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from bot.admin.knowledge_event_views import EventAdminView, EventEditMenuView, EventEditSession
+import bot.admin.knowledge_event_views as event_views
+from bot.admin.knowledge_event_views import (
+    EventAdminView,
+    EventEditSession,
+    EventInfoModal,
+)
 from bot.admin.knowledge_suit_views import SuitRelationModal
 from bot.main import create_suit_embed
 from bot.main import create_event_response_view
 from database.database import get_connection, init_database
-from database.knowledge_query_repository import KnowledgeQueryRepository
+from database.knowledge_query_repository import EventEditContext, KnowledgeQueryRepository
 
 
 def seed_events(database_path: Path) -> tuple[int, int]:
@@ -83,8 +90,67 @@ def test_only_administrators_receive_event_management_buttons() -> None:
     assert isinstance(admin_view, EventAdminView)
     assert create_event_response_view(1, "活動", False) is None
     assert {child.label for child in admin_view.children} == {"✏️ 編輯", "✅ 標記已確認"}
-    menu = EventEditMenuView(EventEditSession(1, 2, 3, 4, 5))
-    assert {child.label for child in menu.children} == {"1️⃣ 活動資訊", "2️⃣ 完成編輯", "3️⃣ 取消"}
+
+
+class ModalResponse:
+    def __init__(self) -> None:
+        self.modal: EventInfoModal | None = None
+        self.messages: list[dict[str, object]] = []
+
+    async def send_modal(self, modal: EventInfoModal) -> None:
+        self.modal = modal
+
+    async def send_message(self, *args: object, **kwargs: object) -> None:
+        self.messages.append({"args": args, **kwargs})
+
+
+def test_event_edit_button_opens_event_info_modal_directly(monkeypatch) -> None:
+    context = EventEditContext(
+        event_id=9,
+        name="直接編輯活動",
+        content_type="event",
+        event_status=None,
+        official_series=None,
+        notes=None,
+        start_at=None,
+        end_at=None,
+        event_type_id=None,
+        event_type_name=None,
+        is_visible=True,
+    )
+
+    class Repository:
+        def get_event_edit_context(self, event_id: int) -> EventEditContext:
+            assert event_id == 9
+            return context
+
+        def get_event_suit_names(self, event_id: int) -> list[str]:
+            assert event_id == 9
+            return ["既有套裝"]
+
+    async def allow_administrator(_interaction: object) -> bool:
+        return True
+
+    response = ModalResponse()
+    interaction = SimpleNamespace(
+        message=SimpleNamespace(id=30),
+        channel_id=20,
+        guild_id=10,
+        user=SimpleNamespace(id=40),
+        response=response,
+    )
+    monkeypatch.setattr(event_views, "KnowledgeQueryRepository", lambda: Repository())
+    monkeypatch.setattr(event_views, "require_administrator", allow_administrator)
+    view = EventAdminView(9, "直接編輯活動")
+    edit_button = next(child for child in view.children if child.label == "✏️ 編輯")
+
+    asyncio.run(edit_button.callback(interaction))
+
+    assert isinstance(response.modal, EventInfoModal)
+    assert response.modal.menu_message is None
+    assert response.modal.session == EventEditSession(10, 20, 30, 9, 40)
+    assert str(response.modal.suits.default) == "既有套裝"
+    assert response.messages == []
 
 
 def test_compact_event_info_creates_category_and_validates_period(tmp_path: Path) -> None:
@@ -100,6 +166,126 @@ def test_compact_event_info_creates_category_and_validates_period(tmp_path: Path
     assert context.start_at == "2026-07-10T05:00:00+08:00"
     with pytest.raises(ValueError, match="結束時間"):
         repository.save_event_info(event_id, "扭蛋", "2026-07-16 23:59", "2026-07-10 05:00", None)
+
+
+def test_event_info_allows_a_blank_category_and_clears_event_type(tmp_path: Path) -> None:
+    database_path = tmp_path / "blank-category.db"
+    event_id, _ = seed_events(database_path)
+    repository = KnowledgeQueryRepository(database_path)
+
+    repository.save_event_info(event_id, "扭蛋", "2026-07-10 05:00", "2026-07-16 23:59", None)
+    repository.save_event_info(event_id, "  ", "2026-07-10 05:00", "2026-07-16 23:59", None)
+
+    context = repository.get_event_edit_context(event_id)
+    assert context is not None
+    assert context.event_type_id is None
+    assert context.event_type_name is None
+
+
+def test_event_info_modal_defaults_to_comma_separated_current_suit_names() -> None:
+    context = EventEditContext(
+        event_id=1,
+        name="測試活動",
+        content_type="event",
+        event_status=None,
+        official_series=None,
+        notes=None,
+        start_at="2026-07-10T05:00:00+08:00",
+        end_at="2026-07-16T23:59:00+08:00",
+        event_type_id=None,
+        event_type_name=None,
+        is_visible=True,
+    )
+
+    modal = EventInfoModal(
+        context,
+        ["苗圃童話", "奇妙大番茄", "森林幻想"],
+        EventEditSession(1, 2, 3, 1, 4),
+        None,
+    )
+
+    assert str(modal.suits.default) == "苗圃童話, 奇妙大番茄, 森林幻想"
+    assert modal.suits.label == "套裝名稱"
+
+
+def test_event_info_suit_sync_adds_removes_retains_and_preserves_other_events(tmp_path: Path) -> None:
+    database_path = tmp_path / "event-info-suits.db"
+    init_database(database_path)
+    connection = get_connection(database_path)
+    try:
+        first_event_id = int(
+            connection.execute(
+                "INSERT INTO events (name, created_at, updated_at) VALUES ('活動一', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+            ).lastrowid
+        )
+        second_event_id = int(
+            connection.execute(
+                "INSERT INTO events (name, created_at, updated_at) VALUES ('活動二', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+            ).lastrowid
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    repository = KnowledgeQueryRepository(database_path)
+    repository.synchronize_event_suits(first_event_id, ["共用套裝", "已移除套裝"])
+    repository.synchronize_event_suits(second_event_id, ["共用套裝"])
+
+    final_names = repository.synchronize_event_suits(first_event_id, ["共用套裝", "新增套裝"])
+
+    assert final_names == ["共用套裝", "新增套裝"]
+    assert repository.get_event_suit_names(first_event_id) == ["共用套裝", "新增套裝"]
+    assert repository.get_event_suit_names(second_event_id) == ["共用套裝"]
+    connection = get_connection(database_path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM suits WHERE name = '共用套裝'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM event_suits WHERE event_id = ?",
+            (first_event_id,),
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM event_suits WHERE event_id = ?",
+            (second_event_id,),
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_event_info_modal_adds_first_suits_with_both_comma_formats_and_refreshes_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database_path = tmp_path / "first-suits.db"
+    event_id, _ = seed_events(database_path)
+    repository = KnowledgeQueryRepository(database_path)
+    context = repository.get_event_edit_context(event_id)
+    assert context is not None
+    refresh_calls: list[EventEditSession] = []
+
+    async def refresh_once(_interaction: object, session: EventEditSession) -> bool:
+        refresh_calls.append(session)
+        return True
+
+    monkeypatch.setattr(event_views, "KnowledgeQueryRepository", lambda: repository)
+    monkeypatch.setattr(event_views, "refresh_public_card", refresh_once)
+    modal = EventInfoModal(context, [], EventEditSession(1, 2, 3, event_id, 4), None)
+    modal.category._value = ""
+    modal.start._value = "2026-07-10 05:00"
+    modal.end._value = "2026-07-16 23:59"
+    modal.notes._value = ""
+    modal.suits._value = "第一套裝, 第一套裝，第二套裝, ，"
+    response = ModalResponse()
+
+    asyncio.run(modal.on_submit(SimpleNamespace(response=response)))
+
+    assert repository.get_event_suit_names(event_id) == ["第一套裝", "第二套裝"]
+    event = repository.get_event_by_id(event_id)
+    assert event is not None
+    assert [suit.name for suit in event.suits] == ["第一套裝", "第二套裝"]
+    assert refresh_calls == [EventEditSession(1, 2, 3, event_id, 4)]
+    assert len(response.messages) == 1
+    assert repository.get_event_edit_context(event_id).event_type_name is None
 
 
 def test_compact_suit_editor_saves_appearance_method_and_cost(tmp_path: Path) -> None:

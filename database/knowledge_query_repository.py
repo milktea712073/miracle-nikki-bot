@@ -437,7 +437,7 @@ class KnowledgeQueryRepository:
             connection.close()
 
     def save_event_info(
-        self, event_id: int, event_type_name: str, start_at: str, end_at: str, notes: str | None
+        self, event_id: int, event_type_name: str | None, start_at: str, end_at: str, notes: str | None
     ) -> None:
         """Save the small set of event-level fields administrators actually correct."""
         from datetime import datetime as date_time
@@ -450,17 +450,18 @@ class KnowledgeQueryRepository:
             raise ValueError("時間格式必須為 YYYY-MM-DD HH:mm。") from error
         if end < start:
             raise ValueError("結束時間不得早於開始時間。")
-        category = event_type_name.strip()
-        if not category:
-            raise ValueError("活動分類不可為空白。")
+        category = (event_type_name or "").strip()
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            row = connection.execute("SELECT id FROM event_types WHERE name = ?", (category,)).fetchone()
-            if row is None:
-                event_type_id = int(connection.execute("INSERT INTO event_types (name, is_active) VALUES (?, 1)", (category,)).lastrowid)
+            if category:
+                row = connection.execute("SELECT id FROM event_types WHERE name = ?", (category,)).fetchone()
+                if row is None:
+                    event_type_id = int(connection.execute("INSERT INTO event_types (name, is_active) VALUES (?, 1)", (category,)).lastrowid)
+                else:
+                    event_type_id = int(row[0])
             else:
-                event_type_id = int(row[0])
+                event_type_id = None
             now = datetime.now(timezone.utc).isoformat()
             connection.execute("UPDATE events SET event_type_id = ?, description = ?, data_status = 'verified', updated_via = 'discord_admin', updated_at = ? WHERE id = ?", (event_type_id, notes or None, now, event_id))
             period = connection.execute("SELECT id FROM event_periods WHERE event_id = ? ORDER BY start_at DESC, id DESC LIMIT 1", (event_id,)).fetchone()

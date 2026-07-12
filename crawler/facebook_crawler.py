@@ -29,7 +29,10 @@ FACEBOOK_PAGE_URL: Final = "https://www.facebook.com/TwNikkiNikki"
 OFFICIAL_PAGE_SLUG: Final = "TwNikkiNikki"
 PAGE_TIMEOUT_MS: Final = 60_000
 DISPLAY_TIMEZONE: Final = ZoneInfo("Asia/Taipei")
-MAX_SCROLL_ATTEMPTS: Final = 8
+MAX_SCROLL_ATTEMPTS: Final = 30
+MAX_CONSECUTIVE_NO_NEW_ROUNDS: Final = 5
+SCROLL_DISTANCE: Final = 2_500
+SCROLL_WAIT_MS: Final = 1_500
 POST_LINK_SELECTOR: Final = (
     "a[href*='/posts/'], a[href*='/videos/'], a[href*='/permalink/'], "
     "a[href*='/reel/'], a[href*='story_fbid='], a[href*='fbid=']"
@@ -131,11 +134,31 @@ def get_post_url_from_hrefs(hrefs: list[str]) -> str:
     raise FacebookCrawlerError("The post article did not contain a permalink.")
 
 
+def get_href_snapshot(locator: Locator, source: str) -> list[str]:
+    """Return a stable href snapshot without waiting on live nth locators.
+
+    Facebook frequently replaces timeline nodes while the page is scrolling.  Reading
+    all attributes in one browser-side evaluation avoids a stale ``nth(index)`` locator
+    waiting for a node which no longer exists.
+    """
+    try:
+        raw_hrefs = locator.evaluate_all(
+            "elements => elements.map(element => element.getAttribute('href'))"
+        )
+    except Exception as error:  # Playwright may lose nodes while Facebook recycles DOM.
+        LOGGER.warning("Could not snapshot %s hrefs; skipping this source: %s", source, error)
+        return []
+
+    if not isinstance(raw_hrefs, list):
+        LOGGER.warning("Unexpected %s href snapshot result; skipping this source.", source)
+        return []
+    return [href for href in raw_hrefs if isinstance(href, str) and href]
+
+
 def get_post_url(article: Locator) -> str:
     """Extract a canonical permalink from a Facebook post article."""
-    links = article.locator(POST_LINK_SELECTOR)
     return get_post_url_from_hrefs(
-        [links.nth(index).get_attribute("href") or "" for index in range(links.count())]
+        get_href_snapshot(article.locator(POST_LINK_SELECTOR), "post container")
     )
 
 
@@ -172,12 +195,46 @@ def merge_post_url_candidates(
 
 def get_full_page_post_anchor_urls(page: Page) -> list[str]:
     """Collect official-page post permalinks from all anchors, not only articles."""
-    anchors = page.locator("a[href]")
     return [
-        anchors.nth(index).get_attribute("href") or ""
-        for index in range(anchors.count())
-        if is_official_page_post_url(anchors.nth(index).get_attribute("href") or "")
+        href
+        for href in get_href_snapshot(page.locator("a[href]"), "page-wide")
+        if is_official_page_post_url(href)
     ]
+
+
+def get_container_post_urls(page: Page) -> list[str]:
+    """Collect post permalinks exposed inside current article or FeedUnit containers."""
+    articles = page.locator(POST_ARTICLE_SELECTOR)
+    try:
+        raw_href_groups = articles.evaluate_all(
+            """
+            (elements, selector) => elements.map(
+                article => Array.from(
+                    article.querySelectorAll(selector),
+                    link => link.getAttribute('href'),
+                ),
+            )
+            """,
+            POST_LINK_SELECTOR,
+        )
+    except Exception as error:  # Facebook can recycle FeedUnit nodes during evaluation.
+        LOGGER.warning("Could not snapshot container hrefs; skipping this source: %s", error)
+        return []
+
+    if not isinstance(raw_href_groups, list):
+        LOGGER.warning("Unexpected container href snapshot result; skipping this source.")
+        return []
+
+    post_urls: list[str] = []
+    for raw_hrefs in raw_href_groups:
+        if not isinstance(raw_hrefs, list):
+            continue
+        hrefs = [href for href in raw_hrefs if isinstance(href, str) and href]
+        try:
+            post_urls.append(get_post_url_from_hrefs(hrefs))
+        except FacebookCrawlerError:
+            continue
+    return post_urls
 
 
 def debug_page_post_anchors(page: Page) -> None:
@@ -286,40 +343,92 @@ def debug_timeline_candidates(page: Page) -> list[TimelineCandidateDebug]:
 def collect_post_url_candidates(
     page: Page, limit: int, debug: bool = False
 ) -> list[PostUrlCandidate]:
-    """Collect container and official-page anchor candidates before post parsing."""
-    container_urls: list[str] = []
-    page_anchor_urls: list[str] = []
-    articles = page.locator(POST_ARTICLE_SELECTOR)
-    articles.first.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
-    page.wait_for_timeout(2_000)
+    """Collect official post candidates across repeated timeline scrolls.
+
+    Facebook can defer ordinary posts and render pinned posts outside FeedUnit/article
+    containers.  Every round therefore scans both container links and the complete page,
+    retaining the first discovery order while tracking canonical URLs separately.
+    """
+    if limit <= 0:
+        return []
+
+    ordered_urls: list[str] = []
+    seen_urls: set[str] = set()
+    sources_by_url: dict[str, set[str]] = {}
+    total_container_urls: set[str] = set()
+    total_page_anchor_urls: set[str] = set()
+    no_new_rounds = 0
+    stop_reason = "maximum scroll rounds"
 
     if debug:
         debug_timeline_candidates(page)
         debug_page_post_anchors(page)
 
-    for _ in range(MAX_SCROLL_ATTEMPTS):
-        for index in range(articles.count()):
-            try:
-                post_url = get_post_url(articles.nth(index))
-            except FacebookCrawlerError:
-                continue
-            container_urls.append(post_url)
+    # Facebook adds FeedUnit and pinned-post anchors after domcontentloaded.
+    page.wait_for_timeout(SCROLL_WAIT_MS)
 
-        page_anchor_urls.extend(get_full_page_post_anchor_urls(page))
-        candidates = merge_post_url_candidates(container_urls, page_anchor_urls)
-        if len(candidates) >= max(limit * 3, limit):
+    for round_number in range(1, MAX_SCROLL_ATTEMPTS + 1):
+        container_urls = get_container_post_urls(page)
+        page_anchor_urls = get_full_page_post_anchor_urls(page)
+        round_new = 0
+
+        for source, urls, total_urls in (
+            ("container", container_urls, total_container_urls),
+            ("page_anchor", page_anchor_urls, total_page_anchor_urls),
+        ):
+            for url in urls:
+                if not is_official_page_post_url(url):
+                    continue
+                canonical_url = normalize_post_url(url)
+                total_urls.add(canonical_url)
+                sources_by_url.setdefault(canonical_url, set()).add(source)
+                if canonical_url in seen_urls:
+                    continue
+                seen_urls.add(canonical_url)
+                ordered_urls.append(canonical_url)
+                round_new += 1
+                if len(ordered_urls) >= limit:
+                    break
+            if len(ordered_urls) >= limit:
+                break
+
+        no_new_rounds = 0 if round_new else no_new_rounds + 1
+        LOGGER.info(
+            "Facebook permalink scroll round=%d container_candidates=%d "
+            "page_anchor_candidates=%d new=%d total=%d no_new_rounds=%d",
+            round_number,
+            len(container_urls),
+            len(page_anchor_urls),
+            round_new,
+            len(ordered_urls),
+            no_new_rounds,
+        )
+
+        if len(ordered_urls) >= limit:
+            stop_reason = "reached limit"
+            break
+        if no_new_rounds >= MAX_CONSECUTIVE_NO_NEW_ROUNDS:
+            stop_reason = "consecutive no-new rounds"
+            break
+        if round_number == MAX_SCROLL_ATTEMPTS:
             break
 
-        if not articles.count():
-            break
-        page.mouse.wheel(0, 2_500)
-        page.wait_for_timeout(1_500)
+        page.mouse.wheel(0, SCROLL_DISTANCE)
+        page.wait_for_timeout(SCROLL_WAIT_MS)
 
-    candidates = merge_post_url_candidates(container_urls, page_anchor_urls)
+    candidates = [
+        PostUrlCandidate(url=url, sources=tuple(sorted(sources_by_url[url])))
+        for url in ordered_urls[:limit]
+    ]
+    LOGGER.info(
+        "Facebook permalink collection stopped: reason=%s container_candidates=%d "
+        "page_anchor_candidates=%d merged_candidates=%d",
+        stop_reason,
+        len(total_container_urls),
+        len(total_page_anchor_urls),
+        len(candidates),
+    )
     if debug:
-        LOGGER.info("Container permalink count: %d", len(set(container_urls)))
-        LOGGER.info("Full-page anchor permalink count: %d", len(set(page_anchor_urls)))
-        LOGGER.info("Merged canonical candidate count: %d", len(candidates))
         for candidate in candidates:
             LOGGER.info("Candidate sources=%s canonical=%s", candidate.sources, candidate.url)
     if len(candidates) < limit:

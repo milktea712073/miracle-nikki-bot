@@ -1,9 +1,13 @@
 from datetime import datetime, timezone
 
+from crawler import facebook_crawler
 from crawler.facebook_crawler import (
     FacebookCrawlerError,
     POST_ARTICLE_SELECTOR,
     PostUrlCandidate,
+    collect_post_url_candidates,
+    get_container_post_urls,
+    get_full_page_post_anchor_urls,
     get_post_id,
     get_post_url_from_hrefs,
     is_official_page_post_url,
@@ -14,6 +18,94 @@ from crawler.facebook_crawler import (
 )
 from crawler.models import Post
 from database.raw_post_repository import RawPostRepository
+
+
+class FakeMouse:
+    """Minimal Playwright mouse replacement that advances a scripted page."""
+
+    def __init__(self, page):
+        self.page = page
+        self.wheel_calls = 0
+
+    def wheel(self, _x, _y):
+        self.wheel_calls += 1
+        self.page.advance_round()
+
+
+class FakePage:
+    """A scrollable mocked Facebook page with one DOM snapshot per round."""
+
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.round_index = 0
+        self.mouse = FakeMouse(self)
+        self.waits = []
+
+    @property
+    def current_round(self):
+        return self.rounds[min(self.round_index, len(self.rounds) - 1)]
+
+    def advance_round(self):
+        self.round_index += 1
+
+    def wait_for_timeout(self, milliseconds):
+        self.waits.append(milliseconds)
+
+
+class SnapshotLocator:
+    """Locator mock that fails if collection tries to read a live nth element."""
+
+    def __init__(self, snapshot, error=None):
+        self.snapshot = snapshot
+        self.error = error
+        self.evaluate_calls = []
+
+    def evaluate_all(self, script, *args):
+        self.evaluate_calls.append((script, args))
+        if self.error:
+            raise self.error
+        return self.snapshot
+
+    def count(self):
+        raise AssertionError("permalink collection must not call Locator.count()")
+
+    def nth(self, _index):
+        raise AssertionError("permalink collection must not call Locator.nth()")
+
+
+class SnapshotPage:
+    """Page mock exposing stable snapshots for page-wide and container anchors."""
+
+    def __init__(self, page_hrefs, container_href_groups, page_error=None, container_error=None):
+        self.page_anchors = SnapshotLocator(page_hrefs, page_error)
+        self.containers = SnapshotLocator(container_href_groups, container_error)
+
+    def locator(self, selector):
+        if selector == "a[href]":
+            return self.page_anchors
+        if selector == POST_ARTICLE_SELECTOR:
+            return self.containers
+        raise AssertionError(f"unexpected selector: {selector}")
+
+
+def collect_from_rounds(monkeypatch, rounds, limit):
+    """Run collection with mocked container and whole-page anchor scans."""
+    page = FakePage(rounds)
+    monkeypatch.setattr(
+        facebook_crawler,
+        "get_container_post_urls",
+        lambda current_page: current_page.current_round["container"],
+    )
+    monkeypatch.setattr(
+        facebook_crawler,
+        "get_full_page_post_anchor_urls",
+        lambda current_page: current_page.current_round["page_anchor"],
+    )
+    return page, collect_post_url_candidates(page, limit)
+
+
+def post_url(post_id):
+    return f"/TwNikkiNikki/posts/{post_id}"
 
 
 def make_post(post_url: str) -> Post:
@@ -159,3 +251,193 @@ def test_pinned_and_regular_posts_are_saved_once_by_permalink_derived_post_id(tm
     assert result.unchanged == 1
     assert repository.raw_post_exists(get_post_id(pinned_url))
     assert repository.raw_post_exists(get_post_id(regular_url))
+
+
+def test_page_anchor_collection_uses_a_single_snapshot_and_ignores_missing_hrefs():
+    page = SnapshotPage(
+        page_hrefs=[None, "", 42, post_url("page-post"), "/OtherPage/posts/not-ours"],
+        container_href_groups=[],
+    )
+
+    assert get_full_page_post_anchor_urls(page) == [post_url("page-post")]
+    assert len(page.page_anchors.evaluate_calls) == 1
+
+
+def test_container_anchor_collection_uses_a_single_snapshot_without_nth_reads():
+    page = SnapshotPage(
+        page_hrefs=[],
+        container_href_groups=[
+            [None, "", "/TwNikkiNikki/photos/ignored", post_url("container-post")],
+            [post_url("second-container-post")],
+        ],
+    )
+
+    assert get_container_post_urls(page) == [
+        "https://www.facebook.com/TwNikkiNikki/posts/container-post",
+        "https://www.facebook.com/TwNikkiNikki/posts/second-container-post",
+    ]
+    assert len(page.containers.evaluate_calls) == 1
+
+
+def test_snapshot_failure_skips_only_the_failed_anchor_source():
+    page = SnapshotPage(
+        page_hrefs=[],
+        container_href_groups=[[post_url("container-still-works")]],
+        page_error=RuntimeError("DOM node was replaced"),
+    )
+
+    assert get_full_page_post_anchor_urls(page) == []
+    assert get_container_post_urls(page) == [
+        "https://www.facebook.com/TwNikkiNikki/posts/container-still-works"
+    ]
+
+
+def test_scroll_re_scans_both_sources_and_collects_new_posts(monkeypatch):
+    page, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {"container": [post_url("regular-1")], "page_anchor": [post_url("pinned-1")]},
+            {"container": [post_url("regular-2")], "page_anchor": [post_url("pinned-2")]},
+        ],
+        limit=4,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == [
+        "regular-1",
+        "pinned-1",
+        "regular-2",
+        "pinned-2",
+    ]
+    assert page.mouse.wheel_calls == 1
+
+
+def test_multiple_pinned_page_anchors_are_collected_in_their_discovery_order(monkeypatch):
+    _, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {
+                "container": [post_url("regular")],
+                "page_anchor": [post_url("pinned-old"), post_url("pinned-new")],
+            }
+        ],
+        limit=3,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == [
+        "regular",
+        "pinned-old",
+        "pinned-new",
+    ]
+
+
+def test_scroll_collection_deduplicates_container_page_anchor_and_query_variants(monkeypatch):
+    _, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {
+                "container": [f"{post_url('same')}?comment_id=1"],
+                "page_anchor": [f"{post_url('same')}?tracking=value", post_url("next")],
+            }
+        ],
+        limit=2,
+    )
+
+    assert [(candidate.url.rsplit("/", 1)[-1], candidate.sources) for candidate in candidates] == [
+        ("same", ("container", "page_anchor")),
+        ("next", ("page_anchor",)),
+    ]
+
+
+def test_one_empty_round_does_not_stop_scroll_collection(monkeypatch):
+    monkeypatch.setattr(facebook_crawler, "MAX_CONSECUTIVE_NO_NEW_ROUNDS", 3)
+    page, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {"container": [post_url("first")], "page_anchor": []},
+            {"container": [], "page_anchor": []},
+            {"container": [], "page_anchor": [post_url("after-empty-round")]},
+        ],
+        limit=2,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == [
+        "first",
+        "after-empty-round",
+    ]
+    assert page.mouse.wheel_calls == 2
+
+
+def test_consecutive_empty_rounds_stop_scroll_collection(monkeypatch):
+    monkeypatch.setattr(facebook_crawler, "MAX_CONSECUTIVE_NO_NEW_ROUNDS", 3)
+    monkeypatch.setattr(facebook_crawler, "MAX_SCROLL_ATTEMPTS", 10)
+    page, candidates = collect_from_rounds(
+        monkeypatch,
+        [{"container": [post_url("first")], "page_anchor": []}] + [
+            {"container": [], "page_anchor": []}
+        ] * 4,
+        limit=10,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == ["first"]
+    assert page.mouse.wheel_calls == 3
+
+
+def test_limit_is_enforced_during_collection_and_preserves_first_discovery_order(monkeypatch):
+    page, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {
+                "container": [post_url("first"), post_url("second")],
+                "page_anchor": [post_url("third"), post_url("fourth")],
+            }
+        ],
+        limit=3,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert page.mouse.wheel_calls == 0
+
+
+def test_scroll_collection_rejects_non_official_and_non_post_anchors(monkeypatch):
+    _, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {
+                "container": [],
+                "page_anchor": [
+                    "/OtherPage/posts/not-ours",
+                    "/TwNikkiNikki/reel/123",
+                    "/TwNikkiNikki/photos/123",
+                    "/TwNikkiNikki/videos/123",
+                    "/share/123",
+                    "https://example.test/TwNikkiNikki/posts/external",
+                    post_url("official"),
+                ],
+            }
+        ],
+        limit=1,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == ["official"]
+
+
+def test_maximum_scroll_rounds_prevents_unbounded_collection(monkeypatch):
+    monkeypatch.setattr(facebook_crawler, "MAX_SCROLL_ATTEMPTS", 3)
+    monkeypatch.setattr(facebook_crawler, "MAX_CONSECUTIVE_NO_NEW_ROUNDS", 10)
+    page, candidates = collect_from_rounds(
+        monkeypatch,
+        [
+            {"container": [post_url("one")], "page_anchor": []},
+            {"container": [post_url("two")], "page_anchor": []},
+            {"container": [post_url("three")], "page_anchor": []},
+            {"container": [post_url("four")], "page_anchor": []},
+        ],
+        limit=10,
+    )
+
+    assert [candidate.url.rsplit("/", 1)[-1] for candidate in candidates] == ["one", "two", "three"]
+    assert page.mouse.wheel_calls == 2
