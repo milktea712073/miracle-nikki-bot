@@ -30,6 +30,7 @@ Thumbs.db
 *.db
 *.log
 secrets.*
+data/facebook_storage_state.json
 
 # Local workspace files
 work/
