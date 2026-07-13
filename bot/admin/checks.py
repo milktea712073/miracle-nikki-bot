@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import logging
 
 import discord
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _configured_ids(variable_name: str) -> set[int]:
@@ -15,6 +19,15 @@ def _configured_ids(variable_name: str) -> set[int]:
         if value.isdigit():
             values.add(int(value))
     return values
+
+
+def is_administrator_channel(channel_id: int | None) -> bool:
+    """Return whether a channel is configured for administrator operations."""
+    channel_ids = _configured_ids("ADMIN_CHANNEL_IDS")
+    if not channel_ids:
+        LOGGER.warning("ADMIN_CHANNEL_IDS is not configured; administrator actions are disabled.")
+        return False
+    return channel_id is not None and channel_id in channel_ids
 
 
 def is_administrator(interaction: discord.Interaction) -> bool:
@@ -33,7 +46,14 @@ def is_administrator(interaction: discord.Interaction) -> bool:
 
 
 async def require_administrator(interaction: discord.Interaction) -> bool:
-    """Send a private denial response when the user is not an administrator."""
+    """Require both an administrator identity and an administrator channel."""
+    if not is_administrator_channel(getattr(interaction, "channel_id", None)):
+        message = "請到指定的管理頻道進行編輯。"
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return False
     if is_administrator(interaction):
         return True
     message = "你沒有使用草稿管理功能的權限。"

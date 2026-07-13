@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from bot.admin.review_commands import register_admin_commands
-from bot.admin.checks import is_administrator
+from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
@@ -73,13 +73,35 @@ def load_dotenv(path: Path) -> None:
         key, value = line.split("=", maxsplit=1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
-
 load_dotenv(PROJECT_ROOT / ".env")
-CHANNEL_IDS = [
-    int(channel_id.strip())
-    for channel_id in os.getenv("CHANNEL_IDS", "").split(",")
-    if channel_id.strip()
-]
+def load_channel_ids(env_name: str) -> list[int]:
+    return [
+        int(channel_id.strip())
+        for channel_id in os.getenv(env_name, "").split(",")
+        if channel_id.strip()
+    ]
+    
+
+
+ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("ANNOUNCEMENT_CHANNEL_IDS")
+QUERY_CHANNEL_IDS = load_channel_ids("QUERY_CHANNEL_IDS")
+ADMIN_CHANNEL_IDS = load_channel_ids("ADMIN_CHANNEL_IDS")
+
+
+def is_query_channel(channel_id: int | None) -> bool:
+    """Allow queries only in explicitly configured query or admin channels."""
+    allowed_channel_ids = set(QUERY_CHANNEL_IDS) | set(ADMIN_CHANNEL_IDS)
+    return channel_id is not None and channel_id in allowed_channel_ids
+
+
+async def require_query_channel(interaction: discord.Interaction) -> bool:
+    """Reject a knowledge query before Discord defers the interaction."""
+    if is_query_channel(interaction.channel_id):
+        return True
+    await interaction.response.send_message(
+        "請到指定的查詢頻道使用此指令。", ephemeral=True
+    )
+    return False
 
 
 class MiracleNikkiBot(commands.Bot):
@@ -117,6 +139,19 @@ async def send_post(destination: discord.abc.Messageable, post: dict[str, object
     await destination.send(embed=create_embed(post))
     for image_url in image_urls[1:]:
         await destination.send(str(image_url))
+
+
+async def send_announcement_post(post: dict[str, object]) -> None:
+    """Send an automatic announcement only to configured announcement channels."""
+    if not ANNOUNCEMENT_CHANNEL_IDS:
+        LOGGER.warning("ANNOUNCEMENT_CHANNEL_IDS is not configured; announcement was not sent.")
+        return
+    for channel_id in ANNOUNCEMENT_CHANNEL_IDS:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            LOGGER.warning("Configured announcement channel %s is unavailable.", channel_id)
+            continue
+        await send_post(channel, post)
 
 
 def format_date(value: str | None) -> str | None:
@@ -260,6 +295,8 @@ async def suit_name_autocomplete(
 @app_commands.describe(name="活動名稱")
 @app_commands.autocomplete(name=event_name_autocomplete)
 async def event_command(interaction: discord.Interaction, name: str) -> None:
+    if not await require_query_channel(interaction):
+        return
     await interaction.response.defer(thinking=True)
     repository = KnowledgeQueryRepository()
     try:
@@ -272,10 +309,14 @@ async def event_command(interaction: discord.Interaction, name: str) -> None:
     if event is None:
         await interaction.followup.send(f"找不到已匯入的活動「{name}」。", ephemeral=True)
         return
-    view = create_event_response_view(event.id, event.name, is_administrator(interaction))
+    can_manage = is_administrator(interaction) and is_administrator_channel(interaction.channel_id)
+    view = create_event_response_view(event.id, event.name, can_manage)
     embed = create_event_embed(event, image_url)
-    add_auto_status_notice(embed, event.data_status, is_administrator(interaction))
-    await interaction.followup.send(embed=embed, view=view)
+    add_auto_status_notice(embed, event.data_status, can_manage)
+    if view is None:
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="套裝", description="查詢已確認匯入的套裝資料")
@@ -283,6 +324,8 @@ async def event_command(interaction: discord.Interaction, name: str) -> None:
 @app_commands.describe(name="套裝名稱")
 @app_commands.autocomplete(name=suit_name_autocomplete)
 async def suit_command(interaction: discord.Interaction, name: str) -> None:
+    if not await require_query_channel(interaction):
+        return
     await interaction.response.defer(thinking=True)
     repository = KnowledgeQueryRepository()
     try:
@@ -295,12 +338,16 @@ async def suit_command(interaction: discord.Interaction, name: str) -> None:
         await interaction.followup.send(f"找不到已匯入的套裝「{name}」。", ephemeral=True)
         return
     image_url = await asyncio.to_thread(repository.get_display_image_for_suit, suit.id)
-    view = create_suit_response_view(suit.id, is_administrator(interaction))
+    can_manage = is_administrator(interaction) and is_administrator_channel(interaction.channel_id)
+    view = create_suit_response_view(suit.id, can_manage)
     embed = create_suit_embed(
-        suit, image_url, show_missing_category=is_administrator(interaction)
+        suit, image_url, show_missing_category=can_manage
     )
-    add_auto_status_notice(embed, suit.data_status, is_administrator(interaction))
-    await interaction.followup.send(embed=embed, view=view)
+    add_auto_status_notice(embed, suit.data_status, can_manage)
+    if view is None:
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.event
@@ -326,10 +373,7 @@ async def check_new_post() -> None:
         )
         image_urls = post.get("image_urls") or post.get("images") or []
         insert_images(connection, announcement_id, [str(url) for url in image_urls])
-        for channel_id in CHANNEL_IDS:
-            channel = bot.get_channel(channel_id)
-            if channel is not None:
-                await send_post(channel, post)
+        await send_announcement_post(post)
     finally:
         connection.close()
 
