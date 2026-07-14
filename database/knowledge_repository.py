@@ -4,12 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from database.database import (
-    get_connection,
-    initialize_knowledge_base_tables,
-    initialize_parse_draft_tables,
-    initialize_raw_tables,
-)
+from database.database import ensure_database_initialized, get_connection
 
 
 def utc_now_iso8601() -> str:
@@ -21,13 +16,10 @@ class KnowledgeRepository:
 
     def __init__(self, database_path: Path | None = None) -> None:
         self._database_path = database_path
+        ensure_database_initialized(database_path)
 
     def connect(self) -> sqlite3.Connection:
-        connection = get_connection(self._database_path)
-        initialize_raw_tables(connection)
-        initialize_parse_draft_tables(connection)
-        initialize_knowledge_base_tables(connection)
-        return connection
+        return get_connection(self._database_path)
 
     def get_parse_draft(self, connection: sqlite3.Connection, draft_id: int) -> dict[str, object] | None:
         row = connection.execute("SELECT * FROM parse_drafts WHERE id = ?", (draft_id,)).fetchone()

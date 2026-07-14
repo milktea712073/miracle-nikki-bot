@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJobRepository
-from database.database import get_connection, initialize_announcement_queue_tables, initialize_raw_tables
+from database.database import ensure_database_initialized, get_connection
 
 
 LOGGER = logging.getLogger(__name__)
@@ -106,12 +106,10 @@ class RawPostRepository:
 
     def __init__(self, database_path: Path | None = None) -> None:
         self._database_path = database_path
+        ensure_database_initialized(database_path)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = get_connection(self._database_path)
-        initialize_raw_tables(connection)
-        initialize_announcement_queue_tables(connection)
-        return connection
+        return get_connection(self._database_path)
 
     def raw_post_exists(self, source_post_id: str) -> bool:
         """Return whether a Facebook post was already persisted."""

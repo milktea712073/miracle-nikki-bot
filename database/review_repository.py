@@ -1,21 +1,18 @@
 """Persistence for human review data and reference-data seeds."""
 
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from database.database import (
-    get_connection,
-    initialize_knowledge_base_tables,
-    initialize_parse_draft_tables,
-    initialize_raw_tables,
-    initialize_review_tables,
-)
+from database.database import DATABASE_PATH, ensure_database_initialized, get_connection
 
 
 EVENT_TYPES = ["普通活動", "體力套", "扭蛋", "大閣", "婚紗", "滿天繁星", "奇妙博物館", "童話夢鄉", "凝砂套裝", "奇淵之嶼", "福袋", "登入送", "破曉之戰", "璀璨華光"]
 ACQUISITION_METHODS = ["花鑽", "儲值", "免費", "體力", "聯盟", "設計圖", "金幣", "其他"]
 REVIEW_STATUSES = {"auto", "needs_review", "pending", "reviewed", "approved", "rejected", "ignored"}
+_REFERENCE_DATA_PATHS: set[Path] = set()
+_REFERENCE_DATA_LOCK = threading.Lock()
 
 
 def now_iso() -> str:
@@ -25,17 +22,27 @@ def now_iso() -> str:
 class ReviewRepository:
     def __init__(self, database_path: Path | None = None) -> None:
         self._database_path = database_path
+        ensure_database_initialized(database_path)
+        self._ensure_reference_data()
+
+    def _ensure_reference_data(self) -> None:
+        """Seed admin reference options once, outside normal connection paths."""
+        path = (self._database_path or DATABASE_PATH).resolve()
+        with _REFERENCE_DATA_LOCK:
+            if path in _REFERENCE_DATA_PATHS:
+                return
+            connection = get_connection(self._database_path)
+            try:
+                self.seed_reference_data(connection)
+            finally:
+                connection.close()
+            _REFERENCE_DATA_PATHS.add(path)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = get_connection(self._database_path)
-        initialize_raw_tables(connection)
-        initialize_parse_draft_tables(connection)
-        initialize_knowledge_base_tables(connection)
-        initialize_review_tables(connection)
-        self.seed_reference_data(connection)
-        return connection
+        return get_connection(self._database_path)
 
-    def seed_reference_data(self, connection: sqlite3.Connection) -> None:
+    @staticmethod
+    def seed_reference_data(connection: sqlite3.Connection) -> None:
         connection.executemany(
             "INSERT OR IGNORE INTO event_types (name, is_active) VALUES (?, 1)",
             [(name,) for name in EVENT_TYPES],

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from database.database import get_connection, initialize_knowledge_base_tables
+from database.database import ensure_database_initialized, get_connection
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +141,11 @@ class KnowledgeQueryRepository:
 
     def __init__(self, database_path: Path | None = None) -> None:
         self._database_path = database_path
+        ensure_database_initialized(database_path)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = get_connection(self._database_path)
-        initialize_knowledge_base_tables(connection)
-        return connection
+        """Open a query connection; schema initialization happens at startup."""
+        return get_connection(self._database_path)
 
     def get_event_by_name(self, name: str) -> EventView | None:
         """Return an event by its exact name, or ``None`` when it is unknown."""

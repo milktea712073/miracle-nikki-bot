@@ -14,7 +14,7 @@ from database.announcement_baseline import (
     apply_announcement_baseline,
     build_announcement_baseline_plan,
 )
-from database.database import get_connection
+from database.database import get_connection, init_database
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +49,7 @@ def print_plan(plan) -> None:
 
 def main() -> int:
     args = parse_args()
+    init_database()
     connection = get_connection()
     try:
         plan = build_announcement_baseline_plan(

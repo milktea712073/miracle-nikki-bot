@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from database.database import announcement_exists, initialize_announcement_queue_tables, initialize_raw_tables
+from database.database import announcement_exists
 
 
 BASELINE_CONTENT_PREFIX = "[baseline skipped; not sent to Discord] "
@@ -78,8 +78,6 @@ def apply_announcement_baseline(
     connection: sqlite3.Connection, plan: AnnouncementBaselinePlan
 ) -> int:
     """Create durable skipped jobs without sending Discord or faking delivery."""
-    initialize_raw_tables(connection)
-    initialize_announcement_queue_tables(connection)
     try:
         connection.execute("BEGIN")
         for url in plan.baseline_urls:

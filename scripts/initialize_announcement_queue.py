@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from database.announcement_job_repository import AnnouncementJobRepository
+from database.database import get_connection, init_database
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,13 +25,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    init_database()
     args = parse_args()
     jobs = AnnouncementJobRepository()
     if jobs.is_initialized():
         print("Announcement queue is already initialized.")
         return 1
 
-    from database.database import get_connection
     connection = get_connection()
     try:
         count = int(connection.execute("SELECT COUNT(*) FROM raw_posts").fetchone()[0])

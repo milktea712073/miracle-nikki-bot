@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from crawler.facebook_crawler import get_latest_posts
 from crawler.models import Post
+from database.database import init_database
 from database.raw_post_repository import RawPostBatchResult, RawPostRepository
 
 
@@ -34,6 +35,7 @@ def fetch_and_save_raw_posts(
     crawler: Callable[[int], list[Post]] = get_latest_posts,
 ) -> FetchRawPostsResult:
     """Fetch recent posts and persist them without involving Discord."""
+    init_database(database_path)
     posts = crawler(limit)
     storage = RawPostRepository(database_path).save_raw_posts(posts)
     if any("locked" in failure.error.lower() for failure in storage.failures):

@@ -11,6 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from database.database import get_connection
 from database.import_service import import_parse_draft
 from database.review_repository import ReviewRepository
+from database.database import init_database
 
 
 STATUS_LABELS = {
@@ -211,6 +212,7 @@ def review_draft(repository: ReviewRepository, draft_id: int, advanced: bool) ->
 
 
 def main() -> None:
+    init_database()
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="暖暖公告草稿審核工具")
     parser.add_argument("--draft-id", type=int, help="直接開啟指定草稿")

@@ -7,11 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from database.database import (
-    get_connection,
-    initialize_announcement_queue_tables,
-    initialize_raw_tables,
-)
+from database.database import ensure_database_initialized, get_connection
 
 
 BASELINE_CONTENT_PREFIX = "[baseline skipped; not sent to Discord] "
@@ -50,12 +46,10 @@ class AnnouncementJobRepository:
 
     def __init__(self, database_path: Path | None = None) -> None:
         self._database_path = database_path
+        ensure_database_initialized(database_path)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = get_connection(self._database_path)
-        initialize_raw_tables(connection)
-        initialize_announcement_queue_tables(connection)
-        return connection
+        return get_connection(self._database_path)
 
     @staticmethod
     def is_initialized_in_connection(connection: sqlite3.Connection) -> bool:

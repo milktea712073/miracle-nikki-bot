@@ -9,10 +9,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from database.announcement_job_repository import AnnouncementJobRepository
+from database.database import init_database
 from scripts.requeue_announcement import print_result
 
 
 def main() -> int:
+    init_database()
     repository = AnnouncementJobRepository()
     post_url = repository.find_latest_sent_announcement_url()
     if post_url is None:

@@ -1,20 +1,46 @@
 """SQLite connection and schema helpers."""
 
 import sqlite3
+import threading
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATABASE_PATH = PROJECT_ROOT / "database" / "database.db"
+SQLITE_TIMEOUT_SECONDS = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+_INITIALIZED_DATABASES: set[Path] = set()
+_INITIALIZATION_LOCK = threading.Lock()
 
 
 def get_connection(database_path: Path | None = None) -> sqlite3.Connection:
-    """Open the project's SQLite database with foreign keys enabled."""
+    """Open a short-lived SQLite connection configured for concurrent callers.
+
+    Schema setup intentionally does not happen here.  Repositories use this helper
+    for normal reads and transactions, while :func:`init_database` owns startup
+    initialization and WAL configuration.
+    """
     path = database_path or DATABASE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SECONDS)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     return connection
+
+
+def ensure_database_initialized(database_path: Path | None = None) -> None:
+    """Initialize a database path once when a standalone repository is used.
+
+    Application entry points call :func:`init_database` eagerly.  This small
+    compatibility guard keeps repository APIs usable by scripts and tests without
+    restoring DDL to their per-operation ``_connect`` methods.
+    """
+    path = (database_path or DATABASE_PATH).resolve()
+    with _INITIALIZATION_LOCK:
+        if path in _INITIALIZED_DATABASES:
+            return
+        init_database(path)
+        _INITIALIZED_DATABASES.add(path)
 
 
 def initialize_raw_tables(connection: sqlite3.Connection) -> None:
@@ -380,9 +406,15 @@ def record_announcement(
 
 
 def init_database(database_path: Path | None = None) -> None:
-    """Initialize legacy and raw tables in the configured SQLite database."""
+    """Initialize all application tables once at process startup.
+
+    WAL allows one writer to coexist with readers.  It is configured here rather
+    than in every repository connection so routine read paths never issue DDL or
+    journal-mode changes while the Discord worker is writing.
+    """
     connection = get_connection(database_path)
     try:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS announcements (
@@ -408,6 +440,7 @@ def init_database(database_path: Path | None = None) -> None:
         initialize_review_tables(connection)
     finally:
         connection.close()
+    _INITIALIZED_DATABASES.add((database_path or DATABASE_PATH).resolve())
 
 
 if __name__ == "__main__":

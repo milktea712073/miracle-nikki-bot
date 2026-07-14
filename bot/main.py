@@ -26,6 +26,7 @@ from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
 from crawler.facebook_crawler import fetch_latest_post
 from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
+from database.database import init_database
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
 
 
@@ -112,6 +113,8 @@ class MiracleNikkiBot(commands.Bot):
     """Discord client that synchronizes its global application commands."""
 
     async def setup_hook(self) -> None:
+        await asyncio.to_thread(init_database)
+        LOGGER.info("SQLite schema initialized with WAL and a 30-second busy timeout.")
         synced_commands = await self.tree.sync()
         LOGGER.info("已同步 %s 個 Slash Commands。", len(synced_commands))
 

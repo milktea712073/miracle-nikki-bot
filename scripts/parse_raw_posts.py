@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from database.auto_import_service import auto_import_parse_draft
+from database.database import init_database
 from database.parse_draft_repository import ParseDraftRepository
 from parser.announcement_parser import parse_announcement
 
@@ -41,6 +42,7 @@ def parse_pending_raw_posts(
     parser_version: str = DEFAULT_PARSER_VERSION,
 ) -> ParseRawPostsResult:
     """Parse pending raw posts; a per-post failure preserves all raw source data."""
+    init_database(database_path)
     if force and raw_post_id is None:
         raise ValueError("--force requires --raw-post-id.")
     repository = ParseDraftRepository(database_path)
