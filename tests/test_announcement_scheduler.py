@@ -117,6 +117,29 @@ def test_worker_processes_at_most_three_jobs_per_poll(monkeypatch, tmp_path):
     assert repository.get_job(4).status == "pending"
 
 
+def test_explicitly_requeued_sent_job_is_sent_again_without_duplicate_ledger(monkeypatch, tmp_path):
+    database_path = tmp_path / "scheduler.db"
+    init_database(database_path)
+    initialize_queue(database_path)
+    post = make_post("requeue")
+    RawPostRepository(database_path).save_raw_post(post)
+    sent: list[str] = []
+    repository = configure_worker(monkeypatch, database_path, sent)
+    asyncio.run(bot_main.check_new_post.coro())
+    assert repository.get_job(1).status == "sent"
+
+    repository.requeue_announcement_job(post.url)
+    asyncio.run(bot_main.check_new_post.coro())
+
+    assert sent == [post.url, post.url]
+    assert repository.get_job(1).status == "sent"
+    connection = get_connection(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
 class Destination:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -135,7 +158,13 @@ def sent_image_urls(destination: Destination) -> list[str]:
 
 
 def test_announcement_image_embeds_preserve_all_images_and_order():
-    for image_count in (1, 5, 6, 10):
+    for image_count, expected_message_sizes in (
+        (1, [1]),
+        (2, [1, 1]),
+        (5, [1, 4]),
+        (10, [1, 9]),
+        (12, [1, 10, 1]),
+    ):
         destination = Destination()
         post = make_post(f"images-{image_count}", image_count=image_count)
 
@@ -143,7 +172,20 @@ def test_announcement_image_embeds_preserve_all_images_and_order():
 
         assert sent_image_urls(destination) == post.images
         assert sum(len(call["embeds"]) for call in destination.calls) == image_count
-        assert len(destination.calls) == 1
+        assert [len(call["embeds"]) for call in destination.calls] == expected_message_sizes
+
+
+def test_announcement_without_images_sends_one_content_embed_without_publish_time():
+    destination = Destination()
+    post = make_post("no-images")
+
+    asyncio.run(bot_main.send_post(destination, bot_main.announcement_payload_from_post(post)))
+
+    assert len(destination.calls) == 1
+    embed = destination.calls[0]["embeds"][0]
+    assert "📅 發布時間" not in (embed.description or "")
+    assert "📝 公告內容" in (embed.description or "")
+    assert post.content in (embed.description or "")
 
 
 def test_multiple_image_batches_remain_one_announcement_record(monkeypatch, tmp_path):

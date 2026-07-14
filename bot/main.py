@@ -126,10 +126,7 @@ def create_embed(post: dict[str, object]) -> discord.Embed:
     image_urls = post.get("image_urls") or post.get("images") or []
     embed = discord.Embed(
         title="🌸 奇蹟暖暖最新公告",
-        description=(
-            f"📅 發布時間\n{post.get('publish_time') or '未提供'}\n\n"
-            f"📝 公告內容\n{post.get('content', '')}"
-        ),
+        description=f"📝 公告內容\n{post.get('content', '')}",
         color=discord.Color.from_rgb(255, 183, 197),
     )
     if image_urls:
@@ -138,21 +135,24 @@ def create_embed(post: dict[str, object]) -> discord.Embed:
 
 
 def announcement_embed_batches(post: dict[str, object]) -> list[list[discord.Embed]]:
-    """Build ordered Discord embed batches without discarding announcement images."""
+    """Keep the main card separate and batch remaining images per message."""
     image_urls = [
         image_url
         for image_url in (post.get("image_urls") or post.get("images") or [])
         if isinstance(image_url, str) and image_url
     ]
-    embeds = [create_embed({**post, "image_urls": image_urls})]
+    main_embed = create_embed({**post, "image_urls": image_urls})
+    remaining_embeds: list[discord.Embed] = []
     for image_url in image_urls[1:]:
         image_embed = discord.Embed(color=discord.Color.from_rgb(255, 183, 197))
         image_embed.set_image(url=image_url)
-        embeds.append(image_embed)
-    return [
-        embeds[index : index + DISCORD_EMBEDS_PER_MESSAGE]
-        for index in range(0, len(embeds), DISCORD_EMBEDS_PER_MESSAGE)
-    ]
+        remaining_embeds.append(image_embed)
+    batches = [[main_embed]]
+    batches.extend(
+        remaining_embeds[index : index + DISCORD_EMBEDS_PER_MESSAGE]
+        for index in range(0, len(remaining_embeds), DISCORD_EMBEDS_PER_MESSAGE)
+    )
+    return batches
 
 
 async def send_post(destination: discord.abc.Messageable, post: dict[str, object]) -> None:

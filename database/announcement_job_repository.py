@@ -37,6 +37,14 @@ class AnnouncementJob:
     images: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class RequeueResult:
+    raw_post_id: int
+    job_id: int
+    old_status: str | None
+    post_url: str
+
+
 class AnnouncementJobRepository:
     """Keep announcement queue state independent from crawler polling order."""
 
@@ -231,6 +239,65 @@ class AnnouncementJobRepository:
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    def requeue_announcement_job(self, post_url: str) -> RequeueResult | None:
+        """Create or reset exactly one job for an explicit manual resend."""
+        connection = self._connect()
+        now = utc_now()
+        try:
+            connection.execute("BEGIN")
+            raw_post = connection.execute(
+                "SELECT id, url FROM raw_posts WHERE url = ?", (post_url,)
+            ).fetchone()
+            if raw_post is None:
+                connection.rollback()
+                return None
+            raw_post_id = int(raw_post[0])
+            existing = connection.execute(
+                "SELECT id, status FROM announcement_jobs WHERE raw_post_id = ?",
+                (raw_post_id,),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    "INSERT INTO announcement_jobs "
+                    "(raw_post_id, status, attempt_count, last_error, created_at, updated_at, sent_at) "
+                    "VALUES (?, 'pending', 0, NULL, ?, ?, NULL)",
+                    (raw_post_id, now, now),
+                )
+                job_id = int(cursor.lastrowid)
+                old_status = None
+            else:
+                job_id = int(existing[0])
+                old_status = str(existing[1])
+                connection.execute(
+                    "UPDATE announcement_jobs SET status = 'pending', attempt_count = 0, "
+                    "last_error = NULL, sent_at = NULL, updated_at = ? WHERE id = ?",
+                    (now, job_id),
+                )
+            connection.commit()
+            return RequeueResult(raw_post_id, job_id, old_status, str(raw_post[1]))
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def find_latest_sent_announcement_url(self) -> str | None:
+        """Return the latest real delivery, excluding legacy baseline/skipped rows."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT a.post_url FROM announcements a "
+                "JOIN raw_posts r ON r.url = a.post_url "
+                "LEFT JOIN announcement_jobs j ON j.raw_post_id = r.id "
+                "WHERE a.content NOT LIKE ? AND COALESCE(j.status, 'sent') != 'skipped' "
+                "ORDER BY CASE WHEN j.sent_at IS NULL THEN 1 ELSE 0 END, "
+                "j.sent_at DESC, a.id DESC LIMIT 1",
+                (f"{BASELINE_CONTENT_PREFIX}%",),
+            ).fetchone()
+            return str(row[0]) if row else None
         finally:
             connection.close()
 
