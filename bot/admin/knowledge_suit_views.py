@@ -192,7 +192,7 @@ class SuitEditSettingsView(discord.ui.View):
             return
         await interaction.response.send_modal(SuitCostModal(self.context, self.event, self.message or interaction.message))
 
-    @discord.ui.button(label="✏️ 校正套裝資訊", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="✏️ 編輯套裝資訊", style=discord.ButtonStyle.primary, row=1)
     async def edit_relation(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await require_administrator(interaction):
             return
@@ -259,14 +259,15 @@ class SuitRelationModal(discord.ui.Modal):
     ) -> None:
         self.context, self.event, self.parent_message = context, event, parent_message
         self.public_message = public_message
-        super().__init__(title="校正套裝資訊")
+        super().__init__(title="編輯套裝資訊")
         self.name = discord.ui.TextInput(label="套裝名稱", default=context.suit_name)
         self.event_type = discord.ui.TextInput(
             label="活動分類",
             default=event.event_type or "",
             required=False,
+            placeholder="例如：普通活動／故事套裝／體力套／登入送"
         )
-        self.method = discord.ui.TextInput(label="取得方式", default=event.acquisition_method or "", required=False)
+        self.method = discord.ui.TextInput(label="取得方式", default=event.acquisition_method or "", required=False,placeholder="例如：花鑽／免費／儲值／聯盟／體力")
         raw_cost = event.cost_text or ""
         self.cost = discord.ui.TextInput(label="花費數量與貨幣／資源", default=raw_cost, required=False)
         for item in (self.name, self.event_type, self.method, self.cost):
