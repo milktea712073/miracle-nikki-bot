@@ -430,7 +430,7 @@ def test_non_mansion_edit_view_has_only_cost_and_acquisition_buttons(tmp_path):
 
     view = SuitEditSettingsView(context, context.events[0])
 
-    assert "✏️ 校正套裝資訊" in {item.label for item in view.children}
+    assert "✏️ 編輯套裝資訊" in {item.label for item in view.children}
 
 
 def test_mansion_edit_view_also_has_a_dedicated_live2d_button(tmp_path):
@@ -442,7 +442,7 @@ def test_mansion_edit_view_also_has_a_dedicated_live2d_button(tmp_path):
     view = SuitEditSettingsView(context, context.events[0])
 
     labels = {item.label for item in view.children}
-    assert "✏️ 校正套裝資訊" in labels
+    assert "✏️ 編輯套裝資訊" in labels
     assert "✨ 設定 Live2D" in labels
 
 

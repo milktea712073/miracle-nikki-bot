@@ -20,7 +20,8 @@ env/
 .conda/
 
 # IDEs and operating systems
-.vscode/
+.vscode/*
+!.vscode/launch.json
 .idea/
 .DS_Store
 Thumbs.db
@@ -28,11 +29,16 @@ Thumbs.db
 # Local data and secrets
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
 *.log
 secrets.*
 data/facebook_storage_state.json
 data/facebook_browser_profile/
 debug/facebook_feed_diagnostic/
+debug/facebook_detail.*
 
 # Local workspace files
 work/
+.pytest-tmp*/
+.test-tmp*/
