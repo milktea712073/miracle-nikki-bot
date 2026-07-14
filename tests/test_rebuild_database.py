@@ -9,10 +9,10 @@ import pytest
 from crawler.models import Post
 from database.database import get_connection, init_database
 from database.raw_post_repository import RawPostBatchResult, RawPostRepository
-from scripts.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
-from scripts.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
-from scripts.rebuild_database import RebuildResult, main, rebuild_database
-from scripts.reset_database import ResetResult
+from scripts.data.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
+from scripts.data.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
+from scripts.data.rebuild_database import RebuildResult, main, rebuild_database
+from scripts.data.reset_database import ResetResult
 
 
 def sample_post() -> Post:
@@ -38,7 +38,7 @@ def fake_result() -> RebuildResult:
 def test_rebuild_requires_exact_yes_before_running() -> None:
     calls: list[int] = []
 
-    exit_code = main(["--limit", "7"], input_fn=lambda _: "YES", runner=lambda limit: calls.append(limit) or fake_result())
+    exit_code = main(["--limit", "7"], input_fn=lambda _: "yes", runner=lambda limit: calls.append(limit) or fake_result())
 
     assert exit_code == 0
     assert calls == []
@@ -46,7 +46,7 @@ def test_rebuild_requires_exact_yes_before_running() -> None:
 
 def test_rebuild_runs_reset_fetch_parse_in_order_and_passes_limit(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, int | None]] = []
-    monkeypatch.setattr("scripts.rebuild_database.count_knowledge_records", lambda _: (2, 3))
+    monkeypatch.setattr("scripts.data.rebuild_database.count_knowledge_records", lambda _: (2, 3))
 
     result = rebuild_database(
         50,
@@ -92,7 +92,7 @@ def test_fetch_failure_stops_parse(tmp_path: Path) -> None:
 def test_parse_failure_keeps_raw_posts(monkeypatch, tmp_path: Path) -> None:
     database_path = tmp_path / "parse-failure.db"
     RawPostRepository(database_path).save_raw_post(sample_post())
-    monkeypatch.setattr("scripts.parse_raw_posts.parse_announcement", lambda _: (_ for _ in ()).throw(RuntimeError("bad parser")))
+    monkeypatch.setattr("scripts.data.parse_raw_posts.parse_announcement", lambda _: (_ for _ in ()).throw(RuntimeError("bad parser")))
 
     result = parse_pending_raw_posts(1, database_path)
 
@@ -117,7 +117,7 @@ def test_fetch_core_passes_limit_to_crawler_and_does_not_send_discord(tmp_path: 
 def test_database_locked_message_is_friendly(capsys) -> None:
     exit_code = main(
         [],
-        input_fn=lambda _: "yes",
+        input_fn=lambda _: "YES",
         runner=lambda _: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
     )
 
@@ -127,7 +127,7 @@ def test_database_locked_message_is_friendly(capsys) -> None:
 
 def test_reset_announcements_requires_second_exact_confirmation() -> None:
     calls: list[int] = []
-    answers = iter(("yes", "NO"))
+    answers = iter(("YES", "NO"))
 
     exit_code = main(
         ["--reset-announcements"],

@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 from playwright.sync_api import Page, Response, sync_playwright
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -30,7 +30,7 @@ from crawler.facebook_session import (  # noqa: E402
     ensure_browser_profile_dir,
     has_login_cookie,
 )
-from scripts.facebook_feed_diagnostic import (  # noqa: E402
+from scripts.diagnostic.facebook_feed_diagnostic import (  # noqa: E402
     DIAGNOSTIC_OUTPUT_DIR,
     TARGET_POST_IDS,
     collect_feed_diagnosis,
@@ -229,7 +229,7 @@ def run_network_diagnostic(rounds: int) -> dict[str, Any]:
             if not has_login_cookie(persistent_context):
                 raise RuntimeError(
                     "專用 Facebook profile 尚未登入。請先執行 "
-                    "python scripts/facebook_feed_diagnostic.py --rounds 1"
+                    "python scripts/diagnostic/facebook_feed_diagnostic.py --rounds 1"
                 )
             page = persistent_context.pages[0] if persistent_context.pages else persistent_context.new_page()
             persistent_feed, persistent_network = record_context(

@@ -5,8 +5,8 @@ from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJobRepository
 from database.database import get_connection, init_database, insert_announcement
 from database.raw_post_repository import RawPostRepository
-from scripts.requeue_announcement import main as requeue_announcement_main
-from scripts.requeue_latest import main as requeue_latest_main
+from scripts.announcement.requeue_announcement import main as requeue_announcement_main
+from scripts.announcement.requeue_latest import main as requeue_latest_main
 
 
 def make_post(post_id: str) -> Post:
@@ -93,7 +93,7 @@ def test_requeue_latest_selects_real_sent_record_not_baseline_or_skipped(tmp_pat
     finally:
         connection.close()
     assert jobs.find_latest_sent_announcement_url() == sent.url
-    monkeypatch.setattr("scripts.requeue_latest.AnnouncementJobRepository", lambda: jobs)
+    monkeypatch.setattr("scripts.announcement.requeue_latest.AnnouncementJobRepository", lambda: jobs)
 
     assert requeue_latest_main() == 0
     assert "Requeued latest announcement:" in capsys.readouterr().out
@@ -103,7 +103,7 @@ def test_requeue_latest_selects_real_sent_record_not_baseline_or_skipped(tmp_pat
 
 def test_requeue_latest_without_sent_record_exits_nonzero(tmp_path, monkeypatch, capsys):
     _, jobs = seeded_repository(tmp_path)
-    monkeypatch.setattr("scripts.requeue_latest.AnnouncementJobRepository", lambda: jobs)
+    monkeypatch.setattr("scripts.announcement.requeue_latest.AnnouncementJobRepository", lambda: jobs)
 
     assert requeue_latest_main() == 1
     assert "No sent announcement found." in capsys.readouterr().out
@@ -111,7 +111,7 @@ def test_requeue_latest_without_sent_record_exits_nonzero(tmp_path, monkeypatch,
 
 def test_requeue_script_reports_missing_raw_post(monkeypatch, tmp_path, capsys):
     _, jobs = seeded_repository(tmp_path)
-    monkeypatch.setattr("scripts.requeue_announcement.AnnouncementJobRepository", lambda: jobs)
+    monkeypatch.setattr("scripts.announcement.requeue_announcement.AnnouncementJobRepository", lambda: jobs)
 
     assert requeue_announcement_main(["--post-url", "https://www.facebook.com/TwNikkiNikki/posts/missing"]) == 1
     assert "Raw post not found." in capsys.readouterr().out

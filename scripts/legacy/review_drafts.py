@@ -211,13 +211,23 @@ def review_draft(repository: ReviewRepository, draft_id: int, advanced: bool) ->
         print(f"已保存：{STATUS_LABELS[status]}。")
 
 
-def main() -> None:
-    init_database()
-    sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="暖暖公告草稿審核工具")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="DEPRECATED legacy terminal draft review and recovery tool"
+    )
     parser.add_argument("--draft-id", type=int, help="直接開啟指定草稿")
     parser.add_argument("--advanced", action="store_true", help="顯示進階欄位")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    print(
+        "DEPRECATED: daily Discord review is retired. "
+        "Use activity and suit card management; this script is retained only for legacy manual recovery."
+    )
+    init_database()
+    sys.stdout.reconfigure(encoding="utf-8")
     repository = ReviewRepository()
     draft_id = args.draft_id
     if draft_id is None:

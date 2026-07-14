@@ -1,4 +1,4 @@
-from scripts.facebook_feed_diagnostic import (
+from scripts.diagnostic.facebook_feed_diagnostic import (
     FeedDiagnosis,
     FeedRound,
     TARGET_POST_IDS,

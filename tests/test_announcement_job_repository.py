@@ -7,7 +7,7 @@ from database.announcement_job_repository import (
 )
 from database.database import get_connection, init_database, insert_announcement
 from database.raw_post_repository import RawPostRepository
-from scripts.reset_database import reset_rebuildable_data
+from scripts.data.reset_database import reset_rebuildable_data
 
 
 def make_post(post_id: str) -> Post:

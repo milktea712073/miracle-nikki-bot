@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -44,7 +44,9 @@ def fetch_and_save_raw_posts(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Fetch Facebook posts and save raw source data. Modifies the local database; does not send Discord."
+    )
     parser.add_argument("--limit", type=int, default=5)
     return parser.parse_args()
 

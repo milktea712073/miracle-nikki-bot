@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from crawler.facebook_crawler import normalize_post_url
@@ -24,8 +24,10 @@ def print_result(result: RequeueResult, *, latest: bool = False) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--post-url", required=True)
+    parser = argparse.ArgumentParser(
+        description="Requeue one canonical Facebook post for an explicit development resend. Preserves sent history."
+    )
+    parser.add_argument("--post-url", required=True, help="Canonical Facebook post URL to requeue.")
     args = parser.parse_args(argv)
     init_database()
     result = AnnouncementJobRepository().requeue_announcement_job(

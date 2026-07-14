@@ -1,5 +1,5 @@
-from scripts.facebook_feed_diagnostic import TARGET_POST_IDS
-from scripts.facebook_feed_network_diagnostic import (
+from scripts.diagnostic.facebook_feed_diagnostic import TARGET_POST_IDS
+from scripts.diagnostic.facebook_feed_network_diagnostic import (
     NetworkResponseRecord,
     extract_pfbids,
     is_facebook_feed_response,

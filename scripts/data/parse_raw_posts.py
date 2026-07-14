@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -69,7 +69,9 @@ def parse_pending_raw_posts(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Parse pending raw posts and update derived knowledge data in the local database."
+    )
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--raw-post-id", type=int)
     parser.add_argument("--force", action="store_true")

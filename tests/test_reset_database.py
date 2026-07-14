@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from database.database import get_connection, init_database
-from scripts.reset_database import reset_database
+from scripts.data.reset_database import reset_database
 
 
 def table_names(connection: sqlite3.Connection) -> set[str]:

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from database.database import get_connection, init_database
-from scripts.cleanup_auto_suits import delete_invalid_auto_suits, find_invalid_auto_suits
+from scripts.data.cleanup_auto_suits import delete_invalid_auto_suits, find_invalid_auto_suits
 
 
 def seed_auto_suits(database_path: Path) -> tuple[int, int]:

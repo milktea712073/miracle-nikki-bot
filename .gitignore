@@ -42,3 +42,4 @@ debug/facebook_detail.*
 work/
 .pytest-tmp*/
 .test-tmp*/
+.pytest-runtime/

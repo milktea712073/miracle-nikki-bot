@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sqlite3
 import sys
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -167,8 +168,15 @@ def print_reset_summary(result: ResetResult) -> None:
     print("=================================")
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return argparse.ArgumentParser(
+        description="DANGEROUS: permanently delete all business records from the local SQLite database."
+    ).parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
     """Request explicit confirmation before irreversibly clearing the database."""
+    parse_args(argv)
     print("This will permanently delete all database records.")
     confirmation = input("Type YES to continue: ").strip()
     if confirmation != "YES":

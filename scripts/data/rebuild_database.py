@@ -11,14 +11,14 @@ from pathlib import Path
 from typing import Callable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from database.database import DATABASE_PATH, get_connection, initialize_knowledge_base_tables
-from scripts.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
-from scripts.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
-from scripts.reset_database import ResetResult, reset_rebuildable_data
+from scripts.data.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
+from scripts.data.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
+from scripts.data.reset_database import ResetResult, reset_rebuildable_data
 
 
 LOGGER = logging.getLogger(__name__)
@@ -72,9 +72,15 @@ def rebuild_database(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="DANGEROUS: reset regenerable data, then fetch and parse Facebook posts."
+    )
     parser.add_argument("--limit", type=int, default=50)
-    parser.add_argument("--reset-announcements", action="store_true")
+    parser.add_argument(
+        "--reset-announcements",
+        action="store_true",
+        help="Also clear announcement jobs and sent delivery history after a second YES confirmation.",
+    )
     return parser.parse_args(argv)
 
 
@@ -103,7 +109,7 @@ def main(
     """Confirm the destructive action and run the development rebuild."""
     args = parse_args(argv)
     print("WARNING: this clears regenerable database records before rebuilding.")
-    if input_fn("Type yes to continue: ").strip() != "yes":
+    if input_fn("Type YES to continue: ").strip() != "YES":
         print("Database rebuild cancelled.")
         return 0
     if args.reset_announcements and input_fn(

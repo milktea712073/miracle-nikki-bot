@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -79,8 +79,12 @@ def delete_invalid_auto_suits(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="List or remove invalid auto-created suits.")
-    parser.add_argument("--apply", action="store_true", help="Delete listed suits after confirmation.")
+    parser = argparse.ArgumentParser(
+        description="List invalid auto-created suits. --apply permanently deletes only the listed auto records."
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="DANGEROUS: delete listed suits after typing YES."
+    )
     return parser.parse_args()
 
 

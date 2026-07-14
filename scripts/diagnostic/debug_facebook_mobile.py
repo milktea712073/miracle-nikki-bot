@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 from playwright.sync_api import Browser, BrowserContext, Error, sync_playwright
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from crawler.facebook_crawler import (
@@ -77,7 +78,14 @@ def diagnose_url(browser: Browser, url: str) -> None:
         context.close()
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return argparse.ArgumentParser(
+        description="Read-only mobile Facebook feed diagnostic; does not write the database."
+    ).parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     sys.stdout.reconfigure(encoding="utf-8")
     with sync_playwright() as playwright:
