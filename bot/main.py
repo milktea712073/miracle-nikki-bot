@@ -18,12 +18,10 @@ from discord.ext import commands, tasks
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from bot.admin.review_commands import register_admin_commands
 from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
-from crawler.facebook_crawler import fetch_latest_post
 from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
 from database.database import init_database
@@ -434,15 +432,6 @@ async def check_new_post() -> None:
         except Exception as error:
             await asyncio.to_thread(repository.mark_failed, job.id, str(error))
             LOGGER.exception("Announcement job %s failed for %s", job.id, job.post_url)
-
-
-@bot.command(name="latest")
-async def latest(ctx: commands.Context[MiracleNikkiBot]) -> None:
-    post = await asyncio.to_thread(fetch_latest_post)
-    await send_post(ctx, post)
-
-
-register_admin_commands(bot)
 
 
 def main() -> None:

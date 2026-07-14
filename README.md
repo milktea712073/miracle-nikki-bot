@@ -21,6 +21,10 @@ pip install -r requirements.txt
 
 `.env` 至少需要設定：`DISCORD_TOKEN`、`ANNOUNCEMENT_CHANNEL_IDS`、`QUERY_CHANNEL_IDS`、`ADMIN_CHANNEL_IDS`。管理員白名單可選擇設定 `DISCORD_ADMIN_USER_IDS` 與 `DISCORD_ADMIN_ROLE_IDS`；多個 ID 使用半形逗號分隔。
 
+## 管理資料
+
+使用 `/活動` 與 `/套裝` 查詢資料；管理員可在管理頻道的資料卡上使用編輯按鈕校正內容。`parse_drafts` 與 `parse_draft_suits` 是 Parser 的內部中間與稽核資料，日常不再提供 Discord 草稿審核指令。
+
 ## 本機敏感資料
 
 `database/database.db`、其 `-wal`／`-shm` 執行期檔案、Facebook storage state/profile，以及登入後產生的 Facebook debug HTML 都只應保留在本機，不應公開分享或提交到 Git。

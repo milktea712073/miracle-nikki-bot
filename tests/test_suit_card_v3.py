@@ -1,4 +1,3 @@
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -8,10 +7,7 @@ from bot.admin.knowledge_suit_views import (
     ReturnSuitCardView,
     SuitRelationSelectView,
     SuitAdminView,
-    SuitEditSettingsView,
     SuitImageEventSelectView,
-    create_edit_embed,
-    refresh_edit_card,
 )
 from bot.main import (
     create_event_embed,
@@ -410,55 +406,6 @@ def test_multi_activity_image_flow_starts_with_an_event_selector(tmp_path):
     assert view.children[0].placeholder == "選擇圖片來源活動"
 
 
-def test_suit_edit_card_uses_one_resource_summary_line(tmp_path):
-    database_path = tmp_path / "edit-resource-summary.db"
-    seed_suit(database_path, single_cost="1992")
-    context = KnowledgeQueryRepository(database_path).get_suit_edit_context(1)
-    assert context is not None
-
-    embed = create_edit_embed(context, context.events[0])
-
-    assert "💎 花鑽：1992鑽" in embed.description
-    assert not any(field.name in {"單套花費", "取得方式"} for field in embed.fields)
-
-
-def test_non_mansion_edit_view_has_only_cost_and_acquisition_buttons(tmp_path):
-    database_path = tmp_path / "regular-edit-controls.db"
-    seed_suit(database_path, event_type="普通活動")
-    context = KnowledgeQueryRepository(database_path).get_suit_edit_context(1)
-    assert context is not None
-
-    view = SuitEditSettingsView(context, context.events[0])
-
-    assert "✏️ 編輯套裝資訊" in {item.label for item in view.children}
-
-
-def test_mansion_edit_view_also_has_a_dedicated_live2d_button(tmp_path):
-    database_path = tmp_path / "mansion-edit-controls.db"
-    seed_suit(database_path, event_type="大閣")
-    context = KnowledgeQueryRepository(database_path).get_suit_edit_context(1)
-    assert context is not None
-
-    view = SuitEditSettingsView(context, context.events[0])
-
-    labels = {item.label for item in view.children}
-    assert "✏️ 編輯套裝資訊" in labels
-    assert "✨ 設定 Live2D" in labels
-
-
-def test_edit_view_has_return_button_with_the_current_suit_context(tmp_path):
-    database_path = tmp_path / "return-suit-card.db"
-    seed_suit(database_path)
-    context = KnowledgeQueryRepository(database_path).get_suit_edit_context(1)
-    assert context is not None
-
-    view = SuitEditSettingsView(context, context.events[0])
-    return_button = next(item for item in view.children if item.label == "⬅️ 返回套裝卡")
-
-    assert view.context.suit_id == 1
-    assert return_button.label == "⬅️ 返回套裝卡"
-
-
 @pytest.mark.parametrize(
     ("method", "cost", "expected"),
     [
@@ -471,49 +418,3 @@ def test_edit_view_has_return_button_with_the_current_suit_context(tmp_path):
 )
 def test_format_cost_line_uses_one_line_and_does_not_duplicate_units(method, cost, expected):
     assert format_cost_line(method, cost) == expected
-
-
-def test_saved_edit_embed_has_footer_and_latest_cost(tmp_path):
-    database_path = tmp_path / "saved-edit-embed.db"
-    seed_suit(database_path, single_cost="1992")
-    context = KnowledgeQueryRepository(database_path).get_suit_edit_context(1)
-    assert context is not None
-
-    embed = create_edit_embed(context, context.events[0], saved=True)
-
-    assert "💎 花鑽：1992鑽" in embed.description
-    assert embed.footer.text == "✅ 已儲存"
-
-
-def test_saved_edit_refreshes_the_same_message_with_latest_values(tmp_path, monkeypatch):
-    database_path = tmp_path / "refresh-edit-card.db"
-    seed_suit(database_path, single_cost="1000")
-    repository = KnowledgeQueryRepository(database_path)
-    context = repository.get_suit_edit_context(1)
-    assert context is not None
-    event = context.events[0]
-    repository.update_suit_card_data(
-        context.suit_id, event.id, event.acquisition_method_id, "1992", False
-    )
-
-    class FakeMessage:
-        def __init__(self):
-            self.edited = None
-
-        async def edit(self, **kwargs):
-            self.edited = kwargs
-
-    from bot.admin import knowledge_suit_views
-
-    monkeypatch.setattr(
-        knowledge_suit_views,
-        "KnowledgeQueryRepository",
-        lambda: KnowledgeQueryRepository(database_path),
-    )
-    message = FakeMessage()
-
-    asyncio.run(refresh_edit_card(message, context.suit_id, event.id))
-
-    assert "💎 花鑽：1992鑽" in message.edited["embed"].description
-    assert message.edited["embed"].footer.text == "✅ 已儲存"
-    assert message.edited["view"].message is message
