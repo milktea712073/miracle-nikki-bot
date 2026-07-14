@@ -94,8 +94,17 @@ def parse_suits(content: str) -> list[SuitCandidate]:
     return suits
 
 
-def classify_content(title: str | None, content: str, has_suits: bool) -> str:
-    """Classify posts so non-activity notices are retained but not made events."""
+EMOJI_CONTENT_TYPE_SIGNALS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("wallpaper", ("\U0001f5bc", "\U0001f3a8")),
+    ("system", ("\U0001f6e0", "\u2699", "\U0001f527")),
+    ("suit_event", ("\U0001f457",)),
+    ("welfare", ("\U0001f381", "\u26f1", "\U0001f389")),
+    ("notice", ("\U0001f4e2", "\U0001f4e3")),
+)
+
+
+def classify_content_from_text(title: str | None, content: str, has_suits: bool) -> str:
+    """Apply the established keyword classification rules without emoji signals."""
     text = "\n".join(filter(None, [title, content]))
     if any(word in text for word in ("\u684c\u5e03", "\u58c1\u7d19", "\u684c\u5e03\u5957\u7d44")):
         return "wallpaper"
@@ -114,6 +123,23 @@ def classify_content(title: str | None, content: str, has_suits: bool) -> str:
     if "\u516c\u544a" in text:
         return "notice"
     return "other"
+
+
+def classify_content_from_emoji(title: str | None, content: str) -> str:
+    """Classify only from emoji placed in the title or opening announcement text."""
+    opening = "\n".join(filter(None, [title, content[:160]])).replace("\ufe0f", "")
+    for content_type, emojis in EMOJI_CONTENT_TYPE_SIGNALS:
+        if any(emoji in opening for emoji in emojis):
+            return content_type
+    return "other"
+
+
+def classify_content(title: str | None, content: str, has_suits: bool) -> str:
+    """Classify posts with keywords first and title emoji as a conservative fallback."""
+    text_result = classify_content_from_text(title, content, has_suits)
+    if text_result != "other":
+        return text_result
+    return classify_content_from_emoji(title, content)
 
 
 def parse_announcement(content: str) -> ParseDraft:

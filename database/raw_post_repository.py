@@ -57,8 +57,10 @@ def ensure_aware(value: datetime) -> datetime:
     return value
 
 
-def to_iso8601(value: datetime) -> str:
-    """Serialize an aware datetime as an ISO 8601 string."""
+def to_iso8601(value: datetime | None) -> str | None:
+    """Serialize an optional aware Facebook publication time."""
+    if value is None:
+        return None
     return ensure_aware(value).isoformat()
 
 

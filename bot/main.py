@@ -23,9 +23,11 @@ from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
-from crawler.facebook_crawler import fetch_latest_post
+from crawler.facebook_crawler import fetch_latest_post, get_latest_posts
+from crawler.models import Post
 from database.database import announcement_exists, get_connection, insert_announcement, insert_images
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
+from database.raw_post_repository import RawPostRepository
 
 
 LOGGER = logging.getLogger(__name__)
@@ -123,7 +125,7 @@ def create_embed(post: dict[str, object]) -> discord.Embed:
     embed = discord.Embed(
         title="🌸 奇蹟暖暖最新公告",
         description=(
-            f"📅 發布時間\n{post.get('publish_time', '未知')}\n\n"
+            f"📅 發布時間\n{post.get('publish_time') or '未提供'}\n\n"
             f"📝 公告內容\n{post.get('content', '')}"
         ),
         color=discord.Color.from_rgb(255, 183, 197),
@@ -152,6 +154,20 @@ async def send_announcement_post(post: dict[str, object]) -> None:
             LOGGER.warning("Configured announcement channel %s is unavailable.", channel_id)
             continue
         await send_post(channel, post)
+
+
+def announcement_payload_from_post(post: Post) -> dict[str, object]:
+    """Create an announcement payload without inventing a Facebook publication time."""
+    return {
+        "publish_time": (
+            post.published_at.strftime("%Y/%m/%d %H:%M")
+            if post.published_at is not None
+            else None
+        ),
+        "content": post.content,
+        "image_urls": post.images,
+        "post_url": post.url,
+    }
 
 
 def format_date(value: str | None) -> str | None:
@@ -360,14 +376,17 @@ async def on_ready() -> None:
 @tasks.loop(minutes=5)
 async def check_new_post() -> None:
     """Keep the existing scheduled latest-post notification behavior."""
-    post = await asyncio.to_thread(fetch_latest_post)
+    latest_posts = await asyncio.to_thread(get_latest_posts, 1)
+    post_model = latest_posts[0]
+    await asyncio.to_thread(RawPostRepository().save_raw_post, post_model)
+    post = announcement_payload_from_post(post_model)
     connection = get_connection()
     try:
         if announcement_exists(connection, str(post["post_url"])):
             return
         announcement_id = insert_announcement(
             connection,
-            str(post["publish_time"]),
+            str(post["publish_time"] or ""),
             str(post["content"]),
             str(post["post_url"]),
         )

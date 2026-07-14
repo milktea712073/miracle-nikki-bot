@@ -11,5 +11,5 @@ class Post:
     post_id: str
     url: str
     content: str
-    published_at: datetime
+    published_at: datetime | None
     images: list[str]

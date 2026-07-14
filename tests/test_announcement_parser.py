@@ -1,4 +1,4 @@
-from parser.announcement_parser import is_valid_suit_name, parse_announcement
+from parser.announcement_parser import classify_content, is_valid_suit_name, parse_announcement
 
 
 def test_rerun_title_period_and_suits():
@@ -38,6 +38,23 @@ def test_wallpaper_is_not_classified_as_an_event():
     draft = parse_announcement("六月桌布套組釋出\n請至官方社群下載桌布")
 
     assert draft.content_type_candidate == "wallpaper"
+
+
+def test_single_title_emoji_classifies_an_otherwise_unclassified_announcement():
+    assert classify_content("\U0001f381 \u6bcf\u65e5\u79ae\u7269", "\u9818\u53d6\u672c\u9031\u793c\u7269", False) == "welfare"
+
+
+def test_multiple_title_emojis_use_the_established_emoji_priority():
+    assert classify_content("\U0001f381 \U0001f5bc \u66f4\u65b0\u901a\u77e5", "\u8cc7\u8a0a\u6574\u7406", False) == "wallpaper"
+
+
+def test_no_emoji_keeps_existing_other_classification():
+    assert classify_content("\u65e5\u5e38\u5206\u4eab", "\u4eca\u5929\u5929\u6c23\u6674\u6717", False) == "other"
+
+
+def test_keyword_classification_wins_when_title_emoji_agrees_or_conflicts():
+    assert classify_content("\U0001f5bc \u684c\u5e03\u66f4\u65b0", "\u684c\u5e03\u5957\u7d44\u91cb\u51fa", False) == "wallpaper"
+    assert classify_content("\U0001f527 \u6d3b\u52d5\u9810\u544a", "\u6d3b\u52d5\u6642\u9593\uff1a2026/07/13", False) == "event"
 
 
 def test_suit_parser_rejects_resources_ui_labels_and_clothing_parts():

@@ -1,5 +1,6 @@
 """Fetch raw posts from the official Miracle Nikki Facebook page."""
 
+import json
 import logging
 import re
 import sys
@@ -9,7 +10,13 @@ from typing import Final
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import (
+    Locator,
+    Page,
+    Response,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 try:
     from crawler.models import Post
@@ -41,10 +48,19 @@ POST_LINK_SELECTOR: Final = (
 POST_ARTICLE_SELECTOR: Final = (
     "div[role='article'], article, div[data-pagelet^='FeedUnit_']"
 )
+MAIN_POST_CONTAINER_SELECTORS: Final = (
+    "div[role='article'], article",
+    "div[data-pagelet^='FeedUnit_']",
+)
+STORY_MESSAGE_SELECTOR: Final = '[data-ad-rendering-role="story_message"]'
+MAX_STORY_MESSAGE_ANCESTOR_DEPTH: Final = 10
+OFFICIAL_PAGE_DISPLAY_NAMES: Final = ("奇迹暖暖", "奇蹟暖暖")
 MESSAGE_SELECTORS: Final = (
     "[data-ad-preview='message']",
     "[data-ad-comet-preview='message']",
 )
+PROFILE_TIMELINE_FEED_OPERATION: Final = "ProfileCometTimelineFeedRefetchQuery"
+GRAPHQL_PERMALINK_FIELDS: Final = ("permalink_url", "wwwURL")
 
 
 class FacebookCrawlerError(RuntimeError):
@@ -69,6 +85,82 @@ class PostUrlCandidate:
 
     url: str
     sources: tuple[str, ...]
+
+
+def graphql_operation_name(post_data: str | None) -> str | None:
+    """Return a GraphQL operation name without retaining request payload data."""
+    if not post_data:
+        return None
+    form_values = parse_qs(post_data, keep_blank_values=True)
+    values = form_values.get("fb_api_req_friendly_name")
+    if values and values[0]:
+        return values[0]
+    try:
+        payload = json.loads(post_data)
+    except json.JSONDecodeError:
+        return None
+    value = payload.get("operationName") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def iter_graphql_json_documents(body: str):
+    """Yield Facebook's concatenated JSON documents without storing response bodies."""
+    payload = body.lstrip().removeprefix("for (;;);").strip()
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(payload):
+        while index < len(payload) and payload[index].isspace():
+            index += 1
+        if index >= len(payload):
+            return
+        try:
+            document, index = decoder.raw_decode(payload, index)
+        except json.JSONDecodeError:
+            return
+        yield document
+
+
+def get_graphql_permalink_urls(document: object) -> list[str]:
+    """Read only trusted permalink fields from one GraphQL JSON document."""
+    urls: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in GRAPHQL_PERMALINK_FIELDS and isinstance(child, str):
+                    if child.startswith("https://www.facebook.com/") and is_official_page_post_url(child):
+                        urls.append(child)
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(document)
+    return urls
+
+
+class GraphQLPermalinkCollector:
+    """Collect official timeline permalinks emitted before Facebook renders DOM cards."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def attach(self, page: Page) -> None:
+        page.on("response", self._handle_response)
+
+    def _handle_response(self, response: Response) -> None:
+        if "/api/graphql" not in urlsplit(response.url).path:
+            return
+        if graphql_operation_name(response.request.post_data) != PROFILE_TIMELINE_FEED_OPERATION:
+            return
+        try:
+            body = response.text()
+        except Exception as error:
+            LOGGER.warning("Could not read Facebook timeline GraphQL response: %s", error)
+            return
+        for document in iter_graphql_json_documents(body):
+            for url in get_graphql_permalink_urls(document):
+                self.urls.append(url)
 
 
 def first_text(locator: Locator, selectors: tuple[str, ...]) -> str:
@@ -285,16 +377,295 @@ def get_post_id(post_url: str) -> str:
     return post_id
 
 
-def get_post_article(page: Page) -> Locator:
-    """Return the first article on the current page that has a post permalink."""
-    articles = page.locator(POST_ARTICLE_SELECTOR)
-    articles.first.wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
+def is_official_page_author_href(href: str) -> bool:
+    """Return whether an author/profile href belongs to the official page itself."""
+    parsed_url = urlsplit(urljoin("https://www.facebook.com", href))
+    return (
+        parsed_url.netloc.lower() in {"facebook.com", "www.facebook.com"}
+        and parsed_url.path.rstrip("/").casefold() == f"/{OFFICIAL_PAGE_SLUG}".casefold()
+    )
 
+
+def has_official_page_identity(container: Locator, hrefs: list[str]) -> bool:
+    """Check official author identity from a card's links or visible author label."""
+    if any(is_official_page_author_href(href) for href in hrefs):
+        return True
+    try:
+        text = container.inner_text()
+    except PlaywrightTimeoutError:
+        return False
+    return any(name in text for name in OFFICIAL_PAGE_DISPLAY_NAMES)
+
+
+def has_post_time(container: Locator) -> bool:
+    """Return whether a card exposes a visible or accessible post-time region."""
+    try:
+        candidates = get_time_attribute_candidates(container)
+    except PlaywrightTimeoutError:
+        return False
+    if any(
+        parse_facebook_time_value(candidate["value"]) is not None
+        for candidate in candidates
+    ):
+        return True
+    try:
+        text = container.inner_text()
+    except PlaywrightTimeoutError:
+        return False
+    return bool(re.search(r"(?:\d+\s*(?:分鐘|小時|天|週|周|月|年)|昨天|剛剛)", text))
+
+
+def get_time_attribute_candidates(container: Locator) -> list[dict[str, str]]:
+    """Return labelled timestamp candidates from one already-trusted post card."""
+    return container.locator(
+        "time[datetime], [data-utime], [data-timestamp], [aria-label], [title]"
+    ).evaluate_all(
+        """
+        elements => elements.flatMap(element => [
+            ['datetime', element.getAttribute('datetime')],
+            ['data-utime', element.getAttribute('data-utime')],
+            ['data-timestamp', element.getAttribute('data-timestamp')],
+            ['aria-label', element.getAttribute('aria-label')],
+            ['title', element.getAttribute('title')],
+        ].filter(([, value]) => value).map(([source, value]) => ({source, value})))
+        """
+    )
+
+
+def parse_facebook_time_value(value: str) -> datetime | None:
+    """Parse an absolute Facebook timestamp from DOM attributes or labels."""
+    value = value.strip()
+    if value.isdigit() and len(value) >= 10:
+        return datetime.fromtimestamp(int(value), DISPLAY_TIMEZONE)
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=DISPLAY_TIMEZONE)
+        return parsed.astimezone(DISPLAY_TIMEZONE)
+
+    matched = re.search(
+        r"(?P<year>\d{4})(?:[/-]|年)(?P<month>\d{1,2})(?:[/-]|月)(?P<day>\d{1,2})(?:日)?"
+        r"(?:\D+(?P<period>上午|下午|AM|PM|am|pm))?\D*"
+        r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+        value,
+    )
+    if not matched:
+        return None
+    hour = int(matched.group("hour"))
+    period = (matched.group("period") or "").casefold()
+    if period in {"下午", "pm"} and hour < 12:
+        hour += 12
+    elif period in {"上午", "am"} and hour == 12:
+        hour = 0
+    try:
+        return datetime(
+            int(matched.group("year")),
+            int(matched.group("month")),
+            int(matched.group("day")),
+            hour,
+            int(matched.group("minute")),
+            tzinfo=DISPLAY_TIMEZONE,
+        )
+    except ValueError:
+        return None
+
+
+def describe_container(container: Locator) -> dict[str, str | None]:
+    """Return minimal DOM metadata for debug logging without serialising page HTML."""
+    try:
+        return container.evaluate(
+            """
+            element => ({
+                tag: element.tagName.toLowerCase(),
+                role: element.getAttribute('role'),
+                className: element.getAttribute('class'),
+            })
+            """
+        )
+    except PlaywrightTimeoutError:
+        return {"tag": None, "role": None, "className": None}
+
+
+def is_story_message_card(
+    container: Locator,
+    post_url: str,
+    page_url: str,
+) -> tuple[bool, dict[str, bool | int]]:
+    """Validate a smallest story-message ancestor as the official post card."""
+    hrefs = get_href_snapshot(container.locator("a[href]"), "detail story card")
+    expected_url = normalize_post_url(post_url)
+    has_permalink = any(
+        is_official_page_post_url(href) and normalize_post_url(href) == expected_url
+        for href in hrefs
+    )
+    has_author = has_official_page_identity(container, hrefs)
+    has_time = has_post_time(container)
+    try:
+        story_count = container.locator(STORY_MESSAGE_SELECTOR).count()
+    except PlaywrightTimeoutError:
+        story_count = 0
+    try:
+        image_count = container.locator("img[src*='scontent']").count()
+    except PlaywrightTimeoutError:
+        image_count = 0
+
+    # A detail URL may omit a canonical anchor in its rendered card.  It is only
+    # accepted as supporting evidence after author, time, and a single message
+    # establish that this is the main card rather than a comment aggregate.
+    page_matches_target = normalize_post_url(page_url) == expected_url
+    trusted = (
+        story_count == 1
+        and has_author
+        and has_time
+        and (has_permalink or page_matches_target)
+    )
+    return trusted, {
+        "official_author": has_author,
+        "permalink": has_permalink,
+        "time": has_time,
+        "images": image_count,
+        "story_count": story_count,
+    }
+
+
+def find_main_post_story_container(page: Page, post_url: str, debug: bool = False) -> Locator | None:
+    """Find the smallest verified card surrounding a rendered story message."""
+    story_messages = page.locator(STORY_MESSAGE_SELECTOR)
+    if debug:
+        LOGGER.info("Facebook detail story_message_count=%d", story_messages.count())
+
+    for message_index in range(story_messages.count()):
+        container = story_messages.nth(message_index)
+        text_only_fallback: Locator | None = None
+        for depth in range(1, MAX_STORY_MESSAGE_ANCESTOR_DEPTH + 1):
+            container = container.locator("xpath=..")
+            if not container.count():
+                break
+            trusted, details = is_story_message_card(container, post_url, page.url)
+            if debug:
+                metadata = describe_container(container)
+                LOGGER.info(
+                    "Facebook detail story_message index=%d depth=%d tag=%s role=%s "
+                    "class=%r author=%s permalink=%s time=%s images=%d "
+                    "story_count=%d selected=%s",
+                    message_index,
+                    depth,
+                    metadata["tag"],
+                    metadata["role"],
+                    metadata["className"],
+                    details["official_author"],
+                    details["permalink"],
+                    details["time"],
+                    details["images"],
+                    details["story_count"],
+                    trusted and bool(details["images"]),
+                )
+            if trusted:
+                if details["images"]:
+                    if debug:
+                        LOGGER.info(
+                            "Facebook detail selected story-message card index=%d depth=%d url=%s",
+                            message_index,
+                            depth,
+                            post_url,
+                        )
+                    return container
+                text_only_fallback = text_only_fallback or container
+        if text_only_fallback is not None:
+            if debug:
+                LOGGER.info(
+                    "Facebook detail selected text-only story-message card index=%d url=%s",
+                    message_index,
+                    post_url,
+                )
+            return text_only_fallback
+    return None
+
+
+def is_matching_main_post_container(hrefs: list[str], post_url: str) -> bool:
+    """Require both the requested permalink and the official page author link."""
+    expected_url = normalize_post_url(post_url)
+    has_permalink = any(
+        is_official_page_post_url(href) and normalize_post_url(href) == expected_url
+        for href in hrefs
+    )
+    return has_permalink and any(is_official_page_author_href(href) for href in hrefs)
+
+
+def log_main_post_container_diagnostics(page: Page, post_url: str) -> None:
+    """Log why each detail-page article is or is not the requested main post."""
+    expected_url = normalize_post_url(post_url)
+    articles = page.locator(POST_ARTICLE_SELECTOR)
+    LOGGER.info(
+        "Facebook detail diagnostics url=%s article_count=%d", post_url, articles.count()
+    )
     for index in range(articles.count()):
         article = articles.nth(index)
-        if article.locator(POST_LINK_SELECTOR).count():
-            return article
-    raise FacebookCrawlerError("Facebook loaded, but no post article was found.")
+        hrefs = get_href_snapshot(article.locator("a[href]"), f"detail article {index}")
+        has_official_author = any(is_official_page_author_href(href) for href in hrefs)
+        has_permalink = any(
+            is_official_page_post_url(href) and normalize_post_url(href) == expected_url
+            for href in hrefs
+        )
+        try:
+            text_length = len(article.inner_text().strip())
+        except PlaywrightTimeoutError:
+            text_length = 0
+        try:
+            image_count = article.locator("img[src*='scontent']").count()
+        except PlaywrightTimeoutError:
+            image_count = 0
+        if not has_permalink:
+            reason = "missing_requested_permalink"
+        elif not has_official_author:
+            reason = "missing_official_author"
+        else:
+            reason = "eligible"
+        LOGGER.info(
+            "Facebook detail article index=%d official_author=%s permalink=%s "
+            "text_length=%d image_count=%d result=%s",
+            index,
+            has_official_author,
+            has_permalink,
+            text_length,
+            image_count,
+            reason,
+        )
+
+
+def get_main_post_article(page: Page, post_url: str, debug: bool = False) -> Locator:
+    """Locate only the official main-post container for the requested permalink."""
+    if debug:
+        log_main_post_container_diagnostics(page, post_url)
+    story_container = find_main_post_story_container(page, post_url, debug=debug)
+    if story_container is not None:
+        return story_container
+    # Prefer the smallest article-level container. FeedUnit is only a fallback for
+    # layouts which do not expose role=article around the primary post.
+    for selector in MAIN_POST_CONTAINER_SELECTORS:
+        containers = page.locator(selector)
+        for index in range(containers.count()):
+            container = containers.nth(index)
+            hrefs = get_href_snapshot(
+                container.locator("a[href]"), f"detail container {index}"
+            )
+            if is_matching_main_post_container(hrefs, post_url):
+                if debug:
+                    LOGGER.info(
+                        "Facebook detail selected trusted main-post container url=%s", post_url
+                    )
+                return container
+    if debug:
+        LOGGER.info(
+            "Facebook detail rejected url=%s reason=no_trusted_main_post_container", post_url
+        )
+    raise FacebookCrawlerError(
+        "Facebook did not expose a trusted official main-post container for this permalink."
+    )
 
 
 def debug_timeline_candidates(page: Page) -> list[TimelineCandidateDebug]:
@@ -341,7 +712,10 @@ def debug_timeline_candidates(page: Page) -> list[TimelineCandidateDebug]:
 
 
 def collect_post_url_candidates(
-    page: Page, limit: int, debug: bool = False
+    page: Page,
+    limit: int,
+    debug: bool = False,
+    graphql_collector: GraphQLPermalinkCollector | None = None,
 ) -> list[PostUrlCandidate]:
     """Collect official post candidates across repeated timeline scrolls.
 
@@ -357,6 +731,8 @@ def collect_post_url_candidates(
     sources_by_url: dict[str, set[str]] = {}
     total_container_urls: set[str] = set()
     total_page_anchor_urls: set[str] = set()
+    total_graphql_urls: set[str] = set()
+    accepted_source_urls = 0
     no_new_rounds = 0
     stop_reason = "maximum scroll rounds"
 
@@ -370,9 +746,11 @@ def collect_post_url_candidates(
     for round_number in range(1, MAX_SCROLL_ATTEMPTS + 1):
         container_urls = get_container_post_urls(page)
         page_anchor_urls = get_full_page_post_anchor_urls(page)
+        graphql_urls = graphql_collector.urls if graphql_collector is not None else []
         round_new = 0
 
         for source, urls, total_urls in (
+            ("graphql", graphql_urls, total_graphql_urls),
             ("container", container_urls, total_container_urls),
             ("page_anchor", page_anchor_urls, total_page_anchor_urls),
         ):
@@ -380,25 +758,28 @@ def collect_post_url_candidates(
                 if not is_official_page_post_url(url):
                     continue
                 canonical_url = normalize_post_url(url)
+                accepted_source_urls += 1
                 total_urls.add(canonical_url)
                 sources_by_url.setdefault(canonical_url, set()).add(source)
                 if canonical_url in seen_urls:
                     continue
+                if len(ordered_urls) >= limit:
+                    continue
                 seen_urls.add(canonical_url)
                 ordered_urls.append(canonical_url)
+                if debug and source == "graphql":
+                    LOGGER.info("Facebook GraphQL added permalink: %s", canonical_url)
                 round_new += 1
-                if len(ordered_urls) >= limit:
-                    break
-            if len(ordered_urls) >= limit:
-                break
 
         no_new_rounds = 0 if round_new else no_new_rounds + 1
         LOGGER.info(
             "Facebook permalink scroll round=%d container_candidates=%d "
-            "page_anchor_candidates=%d new=%d total=%d no_new_rounds=%d",
+            "page_anchor_candidates=%d graphql_candidates=%d new=%d total=%d "
+            "no_new_rounds=%d",
             round_number,
             len(container_urls),
             len(page_anchor_urls),
+            len(graphql_urls),
             round_new,
             len(ordered_urls),
             no_new_rounds,
@@ -422,15 +803,27 @@ def collect_post_url_candidates(
     ]
     LOGGER.info(
         "Facebook permalink collection stopped: reason=%s container_candidates=%d "
-        "page_anchor_candidates=%d merged_candidates=%d",
+        "page_anchor_candidates=%d graphql_candidates=%d merged_candidates=%d "
+        "deduped_candidates=%d returned_candidates=%d",
         stop_reason,
         len(total_container_urls),
         len(total_page_anchor_urls),
+        len(total_graphql_urls),
+        len(sources_by_url),
+        accepted_source_urls - len(sources_by_url),
         len(candidates),
     )
     if debug:
+        LOGGER.info(
+            "Facebook permalink debug DOM permalink=%d GraphQL permalink=%d Merge=%d Dedupe=%d",
+            len(total_container_urls | total_page_anchor_urls),
+            len(total_graphql_urls),
+            len(sources_by_url),
+            accepted_source_urls - len(sources_by_url),
+        )
         for candidate in candidates:
-            LOGGER.info("Candidate sources=%s canonical=%s", candidate.sources, candidate.url)
+            source = "+".join(candidate.sources)
+            LOGGER.info("Facebook permalink source=%s canonical=%s", source, candidate.url)
     if len(candidates) < limit:
         LOGGER.warning(
             "Facebook exposed %d of %d requested posts. "
@@ -446,36 +839,28 @@ def collect_post_urls(page: Page, limit: int, debug: bool = False) -> list[str]:
     return [candidate.url for candidate in collect_post_url_candidates(page, limit, debug)]
 
 
-def get_published_at(page: Page) -> datetime:
+def get_published_at(container: Locator, debug: bool = False) -> datetime:
     """Extract an absolute publication time from a post detail page."""
-    time_elements = page.locator("time[datetime]")
-    for index in range(time_elements.count()):
-        value = time_elements.nth(index).get_attribute("datetime")
-        if not value:
-            continue
-        try:
-            published_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if published_at.tzinfo is None:
-            published_at = published_at.replace(tzinfo=DISPLAY_TIMEZONE)
-        return published_at.astimezone(DISPLAY_TIMEZONE)
+    for candidate in get_time_attribute_candidates(container):
+        published_at = parse_facebook_time_value(candidate["value"])
+        if debug:
+            LOGGER.info(
+                "Facebook detail time candidate source=%s value=%r selected_main_card=true "
+                "accepted=%s",
+                candidate["source"],
+                candidate["value"],
+                published_at is not None,
+            )
+        if published_at is not None:
+            return published_at
 
-    unix_time_elements = page.locator("[data-utime], [data-timestamp]")
-    for index in range(unix_time_elements.count()):
-        value = unix_time_elements.nth(index).get_attribute("data-utime")
-        value = value or unix_time_elements.nth(index).get_attribute("data-timestamp")
-        if value and value.isdigit():
-            return datetime.fromtimestamp(int(value), DISPLAY_TIMEZONE)
-
-    timestamp = re.search(
-        r'"(?:publish_time|creation_time)":(\d{10})', page.content()
-    )
-    if timestamp:
-        return datetime.fromtimestamp(int(timestamp.group(1)), DISPLAY_TIMEZONE)
+    if debug:
+        LOGGER.info(
+            "Facebook detail time rejected reason=no_absolute_candidate_in_selected_main_card"
+        )
 
     raise FacebookCrawlerError(
-        "Facebook did not expose an absolute publication time. "
+        "Facebook did not expose an absolute publication time in the main post container. "
         "Use a persistent Playwright context with a logged-in Facebook session."
     )
 
@@ -521,10 +906,51 @@ def expand_post_content(article: Locator) -> bool:
         return False
 
 
+def get_message_text(message: Locator) -> str:
+    """Read one message node while restoring Facebook emoji images in DOM order.
+
+    Facebook renders inline emoji as small ``img`` nodes whose ``alt`` contains the
+    emoji. Playwright's ``inner_text`` omits those nodes, while ``text_content`` also
+    loses the rendered line breaks. Clone only the selected message node, replace
+    Facebook's emoji images with text nodes, then read its rendered text. Regular
+    post images and accessibility labels are deliberately left untouched.
+    """
+    text = message.evaluate(
+        r"""
+        element => {
+            const clone = element.cloneNode(true);
+            for (const image of clone.querySelectorAll('img[alt]')) {
+                const source = image.getAttribute('src') || '';
+                const alt = (image.getAttribute('alt') || '').trim();
+                const isFacebookEmoji = /\/images\/emoji\.php(?:[/?]|$)/.test(source);
+                if (isFacebookEmoji && alt && alt.length <= 16) {
+                    image.replaceWith(document.createTextNode(alt));
+                }
+            }
+            const sandbox = document.createElement('div');
+            sandbox.style.cssText = 'position:fixed;left:-99999px;top:0;opacity:0;pointer-events:none;';
+            sandbox.append(clone);
+            document.body.append(sandbox);
+            const text = clone.innerText || '';
+            sandbox.remove();
+            return text;
+        }
+        """
+    )
+    return text.strip() if isinstance(text, str) else ""
+
+
 def get_full_post_content(container: Locator) -> str:
     """Return the full message text from a post detail article."""
     expanded = expand_post_content(container)
-    content = first_text(container, MESSAGE_SELECTORS) or container.inner_text().strip()
+    content = ""
+    for selector in MESSAGE_SELECTORS:
+        message = container.locator(selector).first
+        if not message.count():
+            continue
+        content = get_message_text(message)
+        if content:
+            break
     content = re.sub(r"\n\+\d+$", "", content).strip()
     if content and not content.endswith(("\u67e5\u770b\u66f4\u591a", "See more")):
         return content
@@ -539,81 +965,63 @@ def get_full_post_content(container: Locator) -> str:
     )
 
 
-def get_logged_in_message_container(page: Page) -> Locator:
-    """Find the main post card in Facebook's logged-in post layout."""
-    page_title = page.title()
-    if " - " in page_title:
-        title_hint = page_title.split(" - ", maxsplit=1)[1].split(" | Facebook", maxsplit=1)[0]
-        title_hint = title_hint.strip()[:8]
-        if title_hint:
-            title_node = page.locator("div[dir='auto']").filter(
-                has_text=title_hint
-            ).first
-            if title_node.count():
-                post_card = title_node.locator("xpath=ancestor::div[8]")
-                if post_card.count():
-                    return post_card.nth(0)
-
-    candidates = page.locator("div[dir='auto']")
-    best_card: Locator | None = None
-    best_score = -1
-    for index in range(candidates.count()):
-        candidate = candidates.nth(index)
-        text = candidate.inner_text().strip()
-        if not text:
-            continue
-        card = candidate.locator("xpath=ancestor::div[8]")
-        if not card.count():
-            continue
-        card = card.nth(0)
-        score = card.locator("img[src*='scontent']").count() * 10_000 + len(card.inner_text())
-        if score > best_score:
-            best_card = card
-            best_score = score
-
-    if best_card is None:
-        raise FacebookCrawlerError("Facebook did not expose a post message container.")
-    return best_card
-
-
-def open_post_detail(page: Page, post_url: str) -> Locator:
-    """Open a permalink and return the detail page's post article."""
+def open_post_detail(page: Page, post_url: str, debug: bool = False) -> Locator:
+    """Open a permalink and return its trusted official main-post container."""
     page.goto(post_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     dismiss_cookie_dialog(page)
-    message = page.locator(
-        "[data-ad-preview='message'], [data-ad-comet-preview='message']"
-    ).first
-    try:
-        message.wait_for(state="visible", timeout=5_000)
-    except PlaywrightTimeoutError:
-        LOGGER.info("Using the logged-in Facebook message layout for %s", post_url)
+    for attempt in range(2):
         page.wait_for_timeout(2_000)
-        return get_logged_in_message_container(page)
+        try:
+            # Keep the normal call shape for existing integrations and test doubles.
+            # Diagnostic output is opt-in through the debug path only.
+            return (
+                get_main_post_article(page, post_url, debug=True)
+                if debug
+                else get_main_post_article(page, post_url)
+            )
+        except FacebookCrawlerError:
+            if attempt == 0:
+                LOGGER.info("Reloading Facebook detail page to locate main post: %s", post_url)
+                page.reload(wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                dismiss_cookie_dialog(page)
+                continue
+            raise
 
-    page.wait_for_timeout(2_000)
-    article = get_post_article(page)
-    if first_text(article, MESSAGE_SELECTORS):
-        return article
-
-    LOGGER.info("Using the logged-in Facebook message layout for %s", post_url)
-    return get_logged_in_message_container(page)
+    raise FacebookCrawlerError("Facebook did not expose a trusted main post.")
 
 
-def parse_post(page: Page, post_url: str) -> Post:
+def parse_post(page: Page, post_url: str, debug: bool = False) -> Post:
     """Parse one post detail page into the crawler's raw data model."""
-    article = open_post_detail(page, post_url)
+    article = (
+        open_post_detail(page, post_url, debug=True)
+        if debug
+        else open_post_detail(page, post_url)
+    )
+    try:
+        published_at = get_published_at(article, debug=debug)
+    except FacebookCrawlerError:
+        LOGGER.warning(
+            "Facebook did not expose an absolute publication time for %s; "
+            "saving the trusted post without published_at.",
+            post_url,
+        )
+        published_at = None
     return Post(
         post_id=get_post_id(post_url),
         url=post_url,
         content=get_full_post_content(article),
-        published_at=get_published_at(page),
+        published_at=published_at,
         images=get_image_urls(article),
     )
 
 
 def sort_posts_by_published_at(posts: list[Post]) -> list[Post]:
     """Sort parsed posts newest first only after absolute publish times are available."""
-    return sorted(posts, key=lambda post: post.published_at, reverse=True)
+    return sorted(
+        posts,
+        key=lambda post: post.published_at or datetime.min.replace(tzinfo=DISPLAY_TIMEZONE),
+        reverse=True,
+    )
 
 
 def parse_post_candidates(
@@ -624,13 +1032,17 @@ def parse_post_candidates(
     for candidate in candidates:
         try:
             LOGGER.info("Parsing Facebook post sources=%s url=%s", candidate.sources, candidate.url)
-            post = parse_post(page, candidate.url)
+            post = (
+                parse_post(page, candidate.url, debug=True)
+                if debug
+                else parse_post(page, candidate.url)
+            )
             posts.append(post)
             if debug:
                 LOGGER.info(
                     "Parsed post success url=%s published_at=%s",
                     post.url,
-                    post.published_at.isoformat(),
+                    post.published_at.isoformat() if post.published_at else None,
                 )
         except FacebookCrawlerError as error:
             LOGGER.warning("Skipping Facebook post %s: %s", candidate.url, error)
@@ -653,13 +1065,20 @@ def get_latest_posts(limit: int, debug: bool = False) -> list[Post]:
                 )
 
             page = context.new_page()
+            graphql_collector = GraphQLPermalinkCollector()
+            graphql_collector.attach(page)
             page.goto(
                 FACEBOOK_PAGE_URL,
                 wait_until="domcontentloaded",
                 timeout=PAGE_TIMEOUT_MS,
             )
             dismiss_cookie_dialog(page)
-            candidates = collect_post_url_candidates(page, limit, debug=debug)
+            candidates = collect_post_url_candidates(
+                page,
+                limit,
+                debug=debug,
+                graphql_collector=graphql_collector,
+            )
             if not candidates:
                 raise FacebookCrawlerError("No Facebook post permalinks were found.")
             if has_storage_state() and len(candidates) < limit:
@@ -672,17 +1091,23 @@ def get_latest_posts(limit: int, debug: bool = False) -> list[Post]:
 
             if not posts:
                 raise FacebookCrawlerError("Facebook posts were found but none could be parsed.")
-            return sort_posts_by_published_at(posts)[:limit]
+            # Discovery order is the only available ordering when Facebook omits
+            # publication metadata. Permanent de-duplication remains permalink-based.
+            return posts[:limit]
         finally:
             context.close()
             browser.close()
 
 
-def fetch_latest_post() -> dict[str, str | list[str]]:
+def fetch_latest_post() -> dict[str, str | list[str] | None]:
     """Return the newest post in the legacy dictionary format."""
     post = get_latest_posts(1)[0]
     return {
-        "publish_time": post.published_at.strftime("%Y/%m/%d %H:%M"),
+        "publish_time": (
+            post.published_at.strftime("%Y/%m/%d %H:%M")
+            if post.published_at is not None
+            else None
+        ),
         "content": post.content,
         "image_urls": post.images,
         "post_url": post.url,
@@ -702,7 +1127,12 @@ def main() -> None:
     post = get_latest_posts(args.limit, debug=args.debug)[0]
     print("======== \u6700\u65b0\u8cbc\u6587 ========")
     print(f"post_id:\n{post.post_id}")
-    print(f"\u767c\u5e03\u65e5\u671f\uff1a\n{post.published_at:%Y/%m/%d %H:%M}")
+    publish_time = (
+        post.published_at.strftime("%Y/%m/%d %H:%M")
+        if post.published_at is not None
+        else "未提供"
+    )
+    print(f"\u767c\u5e03\u65e5\u671f\uff1a\n{publish_time}")
     print(f"\n\u8cbc\u6587\u5167\u5bb9\uff1a\n{post.content}")
     print(f"\n\u5716\u7247\u7db2\u5740\uff1a\n{post.images}")
     print(f"\n\u8cbc\u6587\u7db2\u5740\uff1a\n{post.url}")

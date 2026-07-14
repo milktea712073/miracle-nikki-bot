@@ -42,6 +42,24 @@ def test_inserts_post_with_ordered_images_and_pending_status(repository):
     assert row["published_at"] == "2026-07-11T04:00:00+00:00"
 
 
+def test_inserts_trusted_post_without_facebook_publication_time(repository):
+    post = Post(
+        post_id="without-time",
+        url="https://www.facebook.com/TwNikkiNikki/posts/without-time",
+        content="可信官方公告",
+        published_at=None,
+        images=["https://images.example/official.png"],
+    )
+
+    saved = repository.save_raw_post(post)
+    row = repository.get_raw_post_by_source_id(post.post_id)
+
+    assert saved.action == "inserted"
+    assert row is not None
+    assert row["published_at"] is None
+    assert row["scraped_at"]
+
+
 def test_duplicate_post_is_unchanged(repository):
     repository.save_raw_post(make_post())
     saved = repository.save_raw_post(make_post())

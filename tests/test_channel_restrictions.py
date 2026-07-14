@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import bot.main as bot_main
 from bot.admin import checks
 from bot.admin.knowledge_event_views import EventAdminView
+from crawler.models import Post
+from database.database import get_connection, init_database
 from database.knowledge_query_repository import EventView, SuitView
 
 
@@ -115,7 +117,7 @@ def test_query_cards_only_show_management_buttons_in_admin_channels(monkeypatch)
     asyncio.run(bot_main.event_command.callback(query_interaction, "測試活動"))
     asyncio.run(bot_main.suit_command.callback(admin_interaction, "測試套裝"))
 
-    assert query_interaction.followup.messages[0][1]["view"] is None
+    assert query_interaction.followup.messages[0][1].get("view") is None
     assert admin_interaction.followup.messages[0][1]["view"] is not None
 
 
@@ -140,6 +142,45 @@ def test_announcement_delivery_only_uses_configured_announcement_channels(monkey
 
     assert len(first.sent) == 1
     assert len(second.sent) == 1
+
+
+def test_new_permalink_without_published_at_is_saved_and_sent_once(monkeypatch, tmp_path) -> None:
+    database_path = tmp_path / "announcements.db"
+    init_database(database_path)
+    post = Post(
+        post_id="new-post",
+        url="https://www.facebook.com/TwNikkiNikki/posts/new-post",
+        content="官方公告",
+        published_at=None,
+        images=["https://images.example/official.png"],
+    )
+    saved_posts: list[Post] = []
+    sent_posts: list[dict[str, object]] = []
+
+    class FakeRawRepository:
+        def save_raw_post(self, value: Post) -> None:
+            saved_posts.append(value)
+
+    async def record_send(value: dict[str, object]) -> None:
+        sent_posts.append(value)
+
+    monkeypatch.setattr(bot_main, "get_latest_posts", lambda _limit: [post])
+    monkeypatch.setattr(bot_main, "RawPostRepository", lambda: FakeRawRepository())
+    monkeypatch.setattr(bot_main, "get_connection", lambda: get_connection(database_path))
+    monkeypatch.setattr(bot_main, "send_announcement_post", record_send)
+
+    asyncio.run(bot_main.check_new_post.coro())
+    asyncio.run(bot_main.check_new_post.coro())
+
+    assert saved_posts == [post, post]
+    assert len(sent_posts) == 1
+    assert sent_posts[0]["publish_time"] is None
+    connection = get_connection(database_path)
+    try:
+        row = connection.execute("SELECT publish_time, post_url FROM announcements").fetchone()
+    finally:
+        connection.close()
+    assert row == ("", post.url)
 
 
 def test_management_callback_rejects_wrong_channel_even_for_configured_admin(monkeypatch) -> None:

@@ -11,6 +11,7 @@ LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 FACEBOOK_STORAGE_STATE_PATH = DATA_DIR / "facebook_storage_state.json"
+FACEBOOK_BROWSER_PROFILE_PATH = DATA_DIR / "facebook_browser_profile"
 FACEBOOK_URL = "https://www.facebook.com"
 
 
@@ -18,6 +19,13 @@ def ensure_data_dir() -> Path:
     """Create and return the local directory used for session state."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return DATA_DIR
+
+
+def ensure_browser_profile_dir() -> Path:
+    """Create and return the dedicated Playwright profile directory."""
+    ensure_data_dir()
+    FACEBOOK_BROWSER_PROFILE_PATH.mkdir(parents=True, exist_ok=True)
+    return FACEBOOK_BROWSER_PROFILE_PATH
 
 
 def has_storage_state() -> bool:
