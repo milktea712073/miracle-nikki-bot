@@ -125,6 +125,20 @@ def test_database_locked_message_is_friendly(capsys) -> None:
     assert "Database is locked" in capsys.readouterr().out
 
 
+def test_reset_announcements_requires_second_exact_confirmation() -> None:
+    calls: list[int] = []
+    answers = iter(("yes", "NO"))
+
+    exit_code = main(
+        ["--reset-announcements"],
+        input_fn=lambda _: next(answers),
+        runner=lambda limit: calls.append(limit) or fake_result(),
+    )
+
+    assert exit_code == 0
+    assert calls == []
+
+
 def test_existing_script_cores_can_run_independently(tmp_path: Path) -> None:
     database_path = tmp_path / "standalone.db"
     init_database(database_path)

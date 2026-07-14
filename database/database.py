@@ -54,6 +54,36 @@ def initialize_raw_tables(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def initialize_announcement_queue_tables(connection: sqlite3.Connection) -> None:
+    """Create durable announcement queue state without changing legacy deliveries."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS announcement_queue_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            initialized_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS announcement_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_post_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'sending', 'sent', 'skipped', 'failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT,
+            FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE CASCADE,
+            UNIQUE(raw_post_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_announcement_jobs_status_created
+            ON announcement_jobs(status, created_at);
+        """
+    )
+    connection.commit()
+
+
 def initialize_parse_draft_tables(connection: sqlite3.Connection) -> None:
     """Create parser draft tables without touching the knowledge-base schema."""
     connection.executescript(
@@ -323,6 +353,32 @@ def insert_images(
     connection.commit()
 
 
+def record_announcement(
+    connection: sqlite3.Connection,
+    publish_time: str,
+    content: str,
+    post_url: str,
+    image_urls: list[str],
+) -> int:
+    """Persist one fully delivered announcement and all of its images atomically."""
+    try:
+        connection.execute("BEGIN")
+        cursor = connection.execute(
+            "INSERT INTO announcements (publish_time, content, post_url) VALUES (?, ?, ?)",
+            (publish_time, content, post_url),
+        )
+        announcement_id = int(cursor.lastrowid)
+        connection.executemany(
+            "INSERT INTO images (announcement_id, image_url) VALUES (?, ?)",
+            [(announcement_id, image_url) for image_url in image_urls],
+        )
+        connection.commit()
+        return announcement_id
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def init_database(database_path: Path | None = None) -> None:
     """Initialize legacy and raw tables in the configured SQLite database."""
     connection = get_connection(database_path)
@@ -344,8 +400,9 @@ def init_database(database_path: Path | None = None) -> None:
             );
             """
         )
-        connection.commit()
         initialize_raw_tables(connection)
+        initialize_announcement_queue_tables(connection)
+        connection.commit()
         initialize_parse_draft_tables(connection)
         initialize_knowledge_base_tables(connection)
         initialize_review_tables(connection)

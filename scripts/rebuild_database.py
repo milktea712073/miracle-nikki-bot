@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from database.database import DATABASE_PATH, get_connection, initialize_knowledge_base_tables
 from scripts.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
 from scripts.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
-from scripts.reset_database import ResetResult, reset_database
+from scripts.reset_database import ResetResult, reset_rebuildable_data
 
 
 LOGGER = logging.getLogger(__name__)
@@ -49,12 +49,16 @@ def rebuild_database(
     limit: int,
     database_path: Path = DATABASE_PATH,
     *,
-    resetter: Callable[[Path], ResetResult] = reset_database,
+    resetter: Callable[[Path], ResetResult] | None = None,
     fetcher: Callable[[int, Path], FetchRawPostsResult] = fetch_and_save_raw_posts,
     parser: Callable[[int, Path], ParseRawPostsResult] = parse_pending_raw_posts,
 ) -> RebuildResult:
-    """Reset, fetch, and parse in order without starting the Discord bot."""
-    reset = resetter(database_path)
+    """Refresh raw data and derived knowledge without destroying queue history."""
+    reset = (
+        resetter(database_path)
+        if resetter is not None
+        else reset_rebuildable_data(database_path)
+    )
     fetch = fetcher(limit, database_path)
     if fetch.fetched_count < limit:
         LOGGER.warning(
@@ -70,6 +74,7 @@ def rebuild_database(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--reset-announcements", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -97,11 +102,25 @@ def main(
 ) -> int:
     """Confirm the destructive action and run the development rebuild."""
     args = parse_args(argv)
-    print("WARNING: this permanently clears all business database records before rebuilding.")
+    print("WARNING: this clears regenerable database records before rebuilding.")
     if input_fn("Type yes to continue: ").strip() != "yes":
         print("Database rebuild cancelled.")
         return 0
-    active_runner = runner or (lambda limit: rebuild_database(limit))
+    if args.reset_announcements and input_fn(
+        "This also clears announcement jobs and sent announcements. Type YES to continue: "
+    ).strip() != "YES":
+        print("Announcement reset cancelled.")
+        return 0
+    active_runner = runner or (
+        lambda limit: rebuild_database(
+            limit,
+            resetter=(
+                lambda path: reset_rebuildable_data(
+                    path, reset_announcements=args.reset_announcements
+                )
+            ),
+        )
+    )
     try:
         result = active_runner(args.limit)
     except sqlite3.OperationalError as error:

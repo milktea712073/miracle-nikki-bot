@@ -5,7 +5,9 @@ import bot.main as bot_main
 from bot.admin import checks
 from bot.admin.knowledge_event_views import EventAdminView
 from crawler.models import Post
+from database.announcement_job_repository import AnnouncementJobRepository
 from database.database import get_connection, init_database
+from database.raw_post_repository import RawPostRepository
 from database.knowledge_query_repository import EventView, SuitView
 
 
@@ -144,6 +146,28 @@ def test_announcement_delivery_only_uses_configured_announcement_channels(monkey
     assert len(second.sent) == 1
 
 
+def test_announcement_delivery_fetches_a_configured_channel_not_in_cache(monkeypatch) -> None:
+    class Destination:
+        async def send(self, **_kwargs: object) -> None:
+            return None
+
+    destination = Destination()
+
+    async def fetch_channel(channel_id: int) -> Destination:
+        assert channel_id == 301
+        return destination
+
+    monkeypatch.setattr(bot_main, "ANNOUNCEMENT_CHANNEL_IDS", [301])
+    monkeypatch.setattr(bot_main.bot, "get_channel", lambda _channel_id: None)
+    monkeypatch.setattr(bot_main.bot, "fetch_channel", fetch_channel)
+
+    asyncio.run(
+        bot_main.send_announcement_post(
+            {"publish_time": "2026/07/12 05:00", "content": "公告", "image_urls": []}
+        )
+    )
+
+
 def test_new_permalink_without_published_at_is_saved_and_sent_once(monkeypatch, tmp_path) -> None:
     database_path = tmp_path / "announcements.db"
     init_database(database_path)
@@ -154,25 +178,20 @@ def test_new_permalink_without_published_at_is_saved_and_sent_once(monkeypatch, 
         published_at=None,
         images=["https://images.example/official.png"],
     )
-    saved_posts: list[Post] = []
     sent_posts: list[dict[str, object]] = []
-
-    class FakeRawRepository:
-        def save_raw_post(self, value: Post) -> None:
-            saved_posts.append(value)
+    jobs = AnnouncementJobRepository(database_path)
+    jobs.initialize_from_existing_raw_posts()
+    RawPostRepository(database_path).save_raw_post(post)
 
     async def record_send(value: dict[str, object]) -> None:
         sent_posts.append(value)
 
-    monkeypatch.setattr(bot_main, "get_latest_posts", lambda _limit: [post])
-    monkeypatch.setattr(bot_main, "RawPostRepository", lambda: FakeRawRepository())
-    monkeypatch.setattr(bot_main, "get_connection", lambda: get_connection(database_path))
+    monkeypatch.setattr(bot_main, "AnnouncementJobRepository", lambda: jobs)
     monkeypatch.setattr(bot_main, "send_announcement_post", record_send)
 
     asyncio.run(bot_main.check_new_post.coro())
     asyncio.run(bot_main.check_new_post.coro())
 
-    assert saved_posts == [post, post]
     assert len(sent_posts) == 1
     assert sent_posts[0]["publish_time"] is None
     connection = get_connection(database_path)

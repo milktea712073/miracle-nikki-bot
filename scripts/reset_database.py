@@ -27,6 +27,16 @@ SUMMARY_TABLES = {
     "announcements": "announcements",
     "images": "images",
 }
+REBUILD_PRESERVED_TABLES = frozenset(
+    {
+        "raw_posts",
+        "raw_post_images",
+        "announcement_jobs",
+        "announcement_queue_settings",
+        "announcements",
+        "images",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +118,39 @@ def reset_database(database_path: Path = DATABASE_PATH) -> ResetResult:
             missing_summary_tables=missing_summary_tables,
             sequence_reset=sequence_reset,
         )
+    finally:
+        connection.close()
+
+
+def reset_rebuildable_data(
+    database_path: Path = DATABASE_PATH, *, reset_announcements: bool = False
+) -> ResetResult:
+    """Clear derived data while preserving raw identity and queue history by default."""
+    if not database_path.exists():
+        raise FileNotFoundError(f"Database file does not exist: {database_path}")
+    connection = get_connection(database_path)
+    try:
+        business_tables = list_business_tables(connection)
+        preserved = set(REBUILD_PRESERVED_TABLES)
+        if reset_announcements:
+            preserved -= {"announcement_jobs", "announcement_queue_settings", "announcements", "images"}
+        cleared = [table for table in business_tables if table not in preserved]
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN")
+            for table_name in cleared:
+                connection.execute(f"DELETE FROM {quote_identifier(table_name)}")
+            if "raw_posts" in business_tables:
+                connection.execute(
+                    "UPDATE raw_posts SET parse_status = 'pending', parse_error = NULL"
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+        return ResetResult(tuple(cleared), (), False)
     finally:
         connection.close()
 

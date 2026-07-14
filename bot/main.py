@@ -23,11 +23,10 @@ from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
-from crawler.facebook_crawler import fetch_latest_post, get_latest_posts
+from crawler.facebook_crawler import fetch_latest_post
 from crawler.models import Post
-from database.database import announcement_exists, get_connection, insert_announcement, insert_images
+from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
-from database.raw_post_repository import RawPostRepository
 
 
 LOGGER = logging.getLogger(__name__)
@@ -89,6 +88,9 @@ ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("ANNOUNCEMENT_CHANNEL_IDS")
 QUERY_CHANNEL_IDS = load_channel_ids("QUERY_CHANNEL_IDS")
 ADMIN_CHANNEL_IDS = load_channel_ids("ADMIN_CHANNEL_IDS")
 
+MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE = 3
+DISCORD_EMBEDS_PER_MESSAGE = 10
+
 
 def is_query_channel(channel_id: int | None) -> bool:
     """Allow queries only in explicitly configured query or admin channels."""
@@ -135,24 +137,45 @@ def create_embed(post: dict[str, object]) -> discord.Embed:
     return embed
 
 
-async def send_post(destination: discord.abc.Messageable, post: dict[str, object]) -> None:
-    """Send the latest post and any additional announcement images."""
-    image_urls = post.get("image_urls") or post.get("images") or []
-    await destination.send(embed=create_embed(post))
+def announcement_embed_batches(post: dict[str, object]) -> list[list[discord.Embed]]:
+    """Build ordered Discord embed batches without discarding announcement images."""
+    image_urls = [
+        image_url
+        for image_url in (post.get("image_urls") or post.get("images") or [])
+        if isinstance(image_url, str) and image_url
+    ]
+    embeds = [create_embed({**post, "image_urls": image_urls})]
     for image_url in image_urls[1:]:
-        await destination.send(str(image_url))
+        image_embed = discord.Embed(color=discord.Color.from_rgb(255, 183, 197))
+        image_embed.set_image(url=image_url)
+        embeds.append(image_embed)
+    return [
+        embeds[index : index + DISCORD_EMBEDS_PER_MESSAGE]
+        for index in range(0, len(embeds), DISCORD_EMBEDS_PER_MESSAGE)
+    ]
+
+
+async def send_post(destination: discord.abc.Messageable, post: dict[str, object]) -> None:
+    """Send one announcement as ordered embed batches, including every image."""
+    for embeds in announcement_embed_batches(post):
+        await destination.send(embeds=embeds)
 
 
 async def send_announcement_post(post: dict[str, object]) -> None:
     """Send an automatic announcement only to configured announcement channels."""
     if not ANNOUNCEMENT_CHANNEL_IDS:
-        LOGGER.warning("ANNOUNCEMENT_CHANNEL_IDS is not configured; announcement was not sent.")
-        return
+        raise RuntimeError("ANNOUNCEMENT_CHANNEL_IDS is not configured")
     for channel_id in ANNOUNCEMENT_CHANNEL_IDS:
         channel = bot.get_channel(channel_id)
         if channel is None:
-            LOGGER.warning("Configured announcement channel %s is unavailable.", channel_id)
-            continue
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.HTTPException as error:
+                raise RuntimeError(
+                    f"Configured announcement channel {channel_id} is unavailable"
+                ) from error
+        if not hasattr(channel, "send"):
+            raise RuntimeError(f"Configured announcement channel {channel_id} is not messageable")
         await send_post(channel, post)
 
 
@@ -167,6 +190,22 @@ def announcement_payload_from_post(post: Post) -> dict[str, object]:
         "content": post.content,
         "image_urls": post.images,
         "post_url": post.url,
+    }
+
+
+def announcement_payload_from_job(job: AnnouncementJob) -> dict[str, object]:
+    """Build the existing announcement card payload from durable raw storage."""
+    publish_time = None
+    if job.published_at:
+        try:
+            publish_time = datetime.fromisoformat(job.published_at).strftime("%Y/%m/%d %H:%M")
+        except ValueError:
+            publish_time = job.published_at
+    return {
+        "publish_time": publish_time,
+        "content": job.content,
+        "image_urls": job.images,
+        "post_url": job.post_url,
     }
 
 
@@ -375,26 +414,23 @@ async def on_ready() -> None:
 
 @tasks.loop(minutes=5)
 async def check_new_post() -> None:
-    """Keep the existing scheduled latest-post notification behavior."""
-    latest_posts = await asyncio.to_thread(get_latest_posts, 1)
-    post_model = latest_posts[0]
-    await asyncio.to_thread(RawPostRepository().save_raw_post, post_model)
-    post = announcement_payload_from_post(post_model)
-    connection = get_connection()
-    try:
-        if announcement_exists(connection, str(post["post_url"])):
-            return
-        announcement_id = insert_announcement(
-            connection,
-            str(post["publish_time"] or ""),
-            str(post["content"]),
-            str(post["post_url"]),
-        )
-        image_urls = post.get("image_urls") or post.get("images") or []
-        insert_images(connection, announcement_id, [str(url) for url in image_urls])
-        await send_announcement_post(post)
-    finally:
-        connection.close()
+    """Deliver durable queued jobs; never choose announcements from the live feed."""
+    repository = AnnouncementJobRepository()
+    recovered = await asyncio.to_thread(repository.recover_interrupted_jobs)
+    if recovered:
+        LOGGER.warning("Recovered %s interrupted announcement job(s).", recovered)
+    jobs = await asyncio.to_thread(repository.claim_jobs, MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE)
+    if not jobs:
+        LOGGER.info("Announcement queue has no pending jobs.")
+        return
+    for job in jobs:
+        try:
+            await send_announcement_post(announcement_payload_from_job(job))
+            await asyncio.to_thread(repository.mark_sent, job.id)
+            LOGGER.info("Announcement job %s sent for %s", job.id, job.post_url)
+        except Exception as error:
+            await asyncio.to_thread(repository.mark_failed, job.id, str(error))
+            LOGGER.exception("Announcement job %s failed for %s", job.id, job.post_url)
 
 
 @bot.command(name="latest")
