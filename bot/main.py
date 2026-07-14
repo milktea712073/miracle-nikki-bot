@@ -26,7 +26,7 @@ from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
 from database.database import init_database
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
-
+from bot.presence import start_presence_rotation
 
 LOGGER = logging.getLogger(__name__)
 TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
@@ -408,6 +408,7 @@ async def suit_command(interaction: discord.Interaction, name: str) -> None:
 
 @bot.event
 async def on_ready() -> None:
+    start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
     if not check_new_post.is_running():
         check_new_post.start()
