@@ -26,6 +26,7 @@ from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
 from database.database import init_database
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
+from scripts.data.fetch_raw_posts import fetch_and_save_raw_posts
 from bot.presence import start_presence_rotation
 
 LOGGER = logging.getLogger(__name__)
@@ -88,7 +89,10 @@ QUERY_CHANNEL_IDS = load_channel_ids("QUERY_CHANNEL_IDS")
 ADMIN_CHANNEL_IDS = load_channel_ids("ADMIN_CHANNEL_IDS")
 
 MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE = 3
+FACEBOOK_POLL_INTERVAL_MINUTES = 5
+FACEBOOK_POLL_LIMIT = 10
 DISCORD_EMBEDS_PER_MESSAGE = 10
+facebook_initial_poll_complete = asyncio.Event()
 
 
 def is_query_channel(channel_id: int | None) -> bool:
@@ -437,13 +441,47 @@ async def suit_command(interaction: discord.Interaction, name: str) -> None:
 async def on_ready() -> None:
     start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
-    if not check_new_post.is_running():
-        check_new_post.start()
+    if not poll_facebook_posts.is_running():
+        poll_facebook_posts.start()
+    if not process_announcement_queue.is_running():
+        process_announcement_queue.start()
+
+
+@tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)
+async def poll_facebook_posts() -> None:
+    """Fetch Facebook posts and enqueue only genuinely new canonical URLs."""
+    try:
+        result = await asyncio.to_thread(
+            fetch_and_save_raw_posts,
+            FACEBOOK_POLL_LIMIT,
+            enqueue_announcements=True,
+        )
+        storage = result.storage
+        LOGGER.info(
+            "Facebook poll completed fetched=%s inserted=%s updated=%s unchanged=%s failed=%s",
+            result.fetched_count,
+            storage.inserted,
+            storage.updated,
+            storage.unchanged,
+            storage.failed,
+        )
+        if result.fetched_count < FACEBOOK_POLL_LIMIT:
+            LOGGER.warning(
+                "Facebook exposed %s post(s), fewer than poll limit %s.",
+                result.fetched_count,
+                FACEBOOK_POLL_LIMIT,
+            )
+    except Exception:
+        LOGGER.exception("Facebook poll failed; the announcement queue will continue running.")
+    finally:
+        facebook_initial_poll_complete.set()
 
 
 @tasks.loop(minutes=5)
-async def check_new_post() -> None:
+async def process_announcement_queue() -> None:
     """Deliver durable queued jobs; never choose announcements from the live feed."""
+    if poll_facebook_posts.is_running():
+        await facebook_initial_poll_complete.wait()
     repository = AnnouncementJobRepository()
     recovered = await asyncio.to_thread(repository.recover_interrupted_jobs)
     if recovered:
@@ -460,6 +498,10 @@ async def check_new_post() -> None:
         except Exception as error:
             await asyncio.to_thread(repository.mark_failed, job.id, str(error))
             LOGGER.exception("Announcement job %s failed for %s", job.id, job.post_url)
+
+
+# Compatibility alias for existing scheduler tests and local integrations.
+check_new_post = process_announcement_queue
 
 
 def main() -> None:

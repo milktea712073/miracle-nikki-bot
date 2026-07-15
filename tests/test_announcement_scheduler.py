@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import bot.main as bot_main
 from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJobRepository
 from database.database import announcement_exists, get_connection, init_database
 from database.raw_post_repository import RawPostRepository
+from scripts.data.fetch_raw_posts import FetchRawPostsResult
 
 
 def make_post(post_id: str, image_count: int = 0) -> Post:
@@ -53,6 +55,116 @@ def test_new_raw_post_creates_one_pending_job_and_update_does_not_duplicate(tmp_
         assert connection.execute("SELECT COUNT(*) FROM announcement_jobs").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_facebook_poller_enqueues_new_posts_without_duplicate_jobs(monkeypatch, tmp_path):
+    database_path = tmp_path / "facebook-poller.db"
+    init_database(database_path)
+    initialize_queue(database_path)
+    post = make_post("polled-new")
+    calls: list[tuple[int, bool]] = []
+
+    def fetch(limit: int, *, enqueue_announcements: bool) -> FetchRawPostsResult:
+        calls.append((limit, enqueue_announcements))
+        storage = RawPostRepository(database_path).save_raw_posts(
+            [post], enqueue_announcements=enqueue_announcements
+        )
+        return FetchRawPostsResult(fetched_count=1, storage=storage)
+
+    monkeypatch.setattr(bot_main, "fetch_and_save_raw_posts", fetch)
+
+    asyncio.run(bot_main.poll_facebook_posts.coro())
+    asyncio.run(bot_main.poll_facebook_posts.coro())
+
+    repository = AnnouncementJobRepository(database_path)
+    assert calls == [
+        (bot_main.FACEBOOK_POLL_LIMIT, True),
+        (bot_main.FACEBOOK_POLL_LIMIT, True),
+    ]
+    assert repository.get_job(1).status == "pending"
+    connection = get_connection(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM announcement_jobs").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_facebook_poller_failure_does_not_block_queue_worker(monkeypatch, tmp_path):
+    database_path = tmp_path / "facebook-poll-failure.db"
+    init_database(database_path)
+    initialize_queue(database_path)
+    post = make_post("queue-survives-fetch-failure")
+    RawPostRepository(database_path).save_raw_post(post)
+    sent: list[str] = []
+    repository = configure_worker(monkeypatch, database_path, sent)
+
+    def fail_fetch(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("Facebook unavailable")
+
+    monkeypatch.setattr(bot_main, "fetch_and_save_raw_posts", fail_fetch)
+    asyncio.run(bot_main.poll_facebook_posts.coro())
+    asyncio.run(bot_main.process_announcement_queue.coro())
+
+    assert sent == [post.url]
+    assert repository.get_job(1).status == "sent"
+
+
+def test_queue_failure_does_not_stop_later_facebook_poll(monkeypatch, tmp_path):
+    database_path = tmp_path / "queue-failure.db"
+    init_database(database_path)
+    initialize_queue(database_path)
+    post = make_post("queue-failure")
+    RawPostRepository(database_path).save_raw_post(post)
+    configure_worker(monkeypatch, database_path, [])
+
+    async def fail_send(_payload: dict[str, object]) -> None:
+        raise RuntimeError("Discord unavailable")
+
+    monkeypatch.setattr(bot_main, "send_announcement_post", fail_send)
+    asyncio.run(bot_main.process_announcement_queue.coro())
+
+    calls: list[tuple[int, bool]] = []
+
+    def fetch(limit: int, *, enqueue_announcements: bool) -> SimpleNamespace:
+        calls.append((limit, enqueue_announcements))
+        return SimpleNamespace(
+            fetched_count=bot_main.FACEBOOK_POLL_LIMIT,
+            storage=SimpleNamespace(inserted=0, updated=0, unchanged=0, failed=0),
+        )
+
+    monkeypatch.setattr(bot_main, "fetch_and_save_raw_posts", fetch)
+
+    asyncio.run(bot_main.poll_facebook_posts.coro())
+
+    assert AnnouncementJobRepository(database_path).get_job(1).status == "failed"
+    assert calls == [(bot_main.FACEBOOK_POLL_LIMIT, True)]
+
+
+def test_on_ready_starts_each_background_task_only_once(monkeypatch):
+    starts: list[str] = []
+
+    class FakeTask:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.running = False
+
+        def is_running(self) -> bool:
+            return self.running
+
+        def start(self) -> None:
+            starts.append(self.name)
+            self.running = True
+
+    facebook_task = FakeTask("facebook")
+    queue_task = FakeTask("queue")
+    monkeypatch.setattr(bot_main, "poll_facebook_posts", facebook_task)
+    monkeypatch.setattr(bot_main, "process_announcement_queue", queue_task)
+    monkeypatch.setattr(bot_main, "start_presence_rotation", lambda _bot: None)
+
+    asyncio.run(bot_main.on_ready())
+    asyncio.run(bot_main.on_ready())
+
+    assert starts == ["facebook", "queue"]
 
 
 def test_pending_job_sends_even_when_the_feed_no_longer_returns_the_post(monkeypatch, tmp_path):

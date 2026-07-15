@@ -82,3 +82,92 @@ def test_suit_event_without_high_confidence_suits_is_flagged_for_follow_up():
 
     assert draft.content_type_candidate == "suit_event"
     assert draft.suits == []
+
+
+def test_suit_parser_accepts_explicit_official_suit_formats_at_high_confidence():
+    draft = parse_announcement(
+        "\u5957\u88dd\u3010\u6d77\u6c99\u66a2\u60f3\u3011\n"
+        "\u6545\u4e8b\u5957\u88dd\u3010\u5e78\u798f\u9810\u5146\u3011\n"
+        "\u5168\u65b0\u5957\u88dd\u3010\u661f\u591c\u5e7b\u5922\u3011\n"
+        "\u7cbe\u7dfb\u5957\u88dd\u3010\u7434\u97f3\u5348\u5f8c\u3011\n"
+        "\u5fa9\u523b\u5957\u88dd\u3010\u7562\u6708\u70cf\u3011\n"
+        "\u6210\u5c31\u5957\u88dd\u3010\u7d05\u8393\u6f2b\u6b4c\u3011\n"
+        "\u6536\u96c6\u5957\u88dd\u3010\u51b0\u8207\u528d\u4e4b\u8a93\u3011\n"
+        "\u7cbe\u7dfb\u7bc0\u65e5\u5957\u88dd\u3010\u528d\u98f2\u6625\u79cb\u3011\n"
+        "\u3010\u96f6\u798f\u9810\u5146\u3011\u5957\u88dd\n"
+        "\u5957\u88dd\u70ba\u3010\u6668\u66e6\u82b1\u5f71\u3011"
+    )
+
+    assert [suit.name for suit in draft.suits] == [
+        "\u6d77\u6c99\u66a2\u60f3",
+        "\u5e78\u798f\u9810\u5146",
+        "\u661f\u591c\u5e7b\u5922",
+        "\u7434\u97f3\u5348\u5f8c",
+        "\u7562\u6708\u70cf",
+        "\u7d05\u8393\u6f2b\u6b4c",
+        "\u51b0\u8207\u528d\u4e4b\u8a93",
+        "\u528d\u98f2\u6625\u79cb",
+        "\u96f6\u798f\u9810\u5146",
+        "\u6668\u66e6\u82b1\u5f71",
+    ]
+    assert all(suit.confidence == 1.0 for suit in draft.suits)
+
+
+def test_suit_parser_rejects_resources_without_an_explicit_suit_context():
+    draft = parse_announcement(
+        "\u53ef\u7372\u5f97\u3010\u661f\u66dc\u77f3\u3011\u3002\u9084\u53ef\u7372\u5f97\u7cbe\u7dfb\u5957\u88dd\u3010\u5143\u6c23\u61c9\u63f4\u3011\u3002\n"
+        "\u7372\u5f97\u3010\u5fc3\u57df\u8993\u5f71\u5238\u3011\n"
+        "\u7372\u5f97\u3010\u87a2\u5149\u68d2\u3011\n"
+        "\u7372\u5f97\u3010\u51b0\u4e4b\u9b44*350\u3011\n"
+        "\u7372\u5f97\u3010\u7cbe\u5bc6\u9f52\u8f2a\u3011"
+    )
+
+    assert [suit.name for suit in draft.suits] == ["\u5143\u6c23\u61c9\u63f4"]
+    assert draft.suits[0].confidence == 1.0
+    assert not is_valid_suit_name("\u661f\u66dc\u77f3")
+    assert not is_valid_suit_name("\u51b0\u4e4b\u9b44*350")
+
+
+def test_suit_parser_keeps_multi_suit_acquisition_list_in_the_same_sentence():
+    draft = parse_announcement(
+        "\u9084\u53ef\u8d0f\u5f97\u3010\u5143\u6c23\u61c9\u63f4\u3011\u3001\u3010\u7d55\u5c0d\u6416\u6efe\u3011\u7cbe\u7dfb\u6f14\u5531\u6703\u4e3b\u984c\u5957\u88dd\u3002"
+    )
+
+    assert [suit.name for suit in draft.suits] == ["\u5143\u6c23\u61c9\u63f4", "\u7d55\u5c0d\u6416\u6efe"]
+    assert all(suit.confidence == 0.9 for suit in draft.suits)
+
+
+def test_suit_parser_keeps_an_explicit_rerun_suit_list_at_high_confidence():
+    draft = parse_announcement(
+        "\u5fa9\u523b\u5957\u88dd\u3010\u7562\u6708\u70cf\u3011\u3001\u3010\u89d2\u6728\u86df\u3011\u3001\u3010\u623f\u65e5\u5154\u3011"
+    )
+
+    assert [suit.name for suit in draft.suits] == ["\u7562\u6708\u70cf", "\u89d2\u6728\u86df", "\u623f\u65e5\u5154"]
+    assert all(suit.confidence == 1.0 for suit in draft.suits)
+
+
+def test_suit_parser_rejects_bracketed_reward_enumerations_with_suit_parts():
+    draft = parse_announcement(
+        "\u7372\u5f97\u3010\u947d\u77f3\u3001\u9ad4\u529b\u3001\u91d1\u5e63\u3001\u9650\u5b9a\u5957\u88dd\u90e8\u4ef6\u3001\u8d85\u7a00\u6709\u9650\u5b9a\u90e8\u4ef6\u3011\u3002\n"
+        "\u7372\u5f97\u3010\u947d\u77f3\u3001\u91d1\u5e63\u3011\u3002\n"
+        "\u7372\u5f97\u3010\u9650\u5b9a\u5957\u88dd\u90e8\u4ef6\u3011\u3002\n"
+        "\u53ef\u7372\u5f97\u5957\u88dd\u3010\u6696\u5fc3\u871c\u610f\u3011\u3002"
+    )
+
+    assert [suit.name for suit in draft.suits] == ["\u6696\u5fc3\u871c\u610f"]
+    assert not is_valid_suit_name(
+        "\u947d\u77f3\u3001\u9ad4\u529b\u3001\u91d1\u5e63\u3001\u9650\u5b9a\u5957\u88dd\u90e8\u4ef6\u3001\u8d85\u7a00\u6709\u9650\u5b9a\u90e8\u4ef6"
+    )
+    assert not is_valid_suit_name("\u947d\u77f3\u3001\u91d1\u5e63")
+    assert not is_valid_suit_name("\u9650\u5b9a\u5957\u88dd\u90e8\u4ef6")
+
+
+def test_suit_parser_keeps_high_confidence_suit_lists_while_rejecting_reward_lists():
+    draft = parse_announcement(
+        "\u5fa9\u523b\u5957\u88dd\u3010\u7562\u6708\u70cf\u3011\u3001\u3010\u89d2\u6728\u86df\u3011\u3002\n"
+        "\u5957\u88dd\u3010\u6696\u5fc3\u871c\u610f\u3011\u3002\n"
+        "\u6210\u5c31\u5957\u88dd\u3010\u6d77\u6c99\u66a2\u60f3\u3011\u3002"
+    )
+
+    assert [suit.name for suit in draft.suits] == ["\u7562\u6708\u70cf", "\u89d2\u6728\u86df", "\u6696\u5fc3\u871c\u610f", "\u6d77\u6c99\u66a2\u60f3"]
+    assert all(suit.confidence == 1.0 for suit in draft.suits)

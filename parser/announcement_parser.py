@@ -13,9 +13,26 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 RERUN_KEYWORDS = ("\u5fa9\u523b", "\u5fa9\u958b", "\u518d\u6b21\u767b\u5834")
 DEBUT_KEYWORDS = ("\u9996\u6b21", "\u5168\u65b0", "\u521d\u6b21")
 SUIT_CONTEXT_KEYWORDS = ("\u53ef\u7372\u5f97", "\u53ef\u8d0f\u5f97", "\u7372\u5f97", "\u6545\u4e8b\u5957\u88dd", "\u7cbe\u7dfb\u5957\u88dd", "\u96c6\u9f4a")
+HIGH_CONFIDENCE_SUIT_PREFIXES = (
+    "\u5957\u88dd\u70ba",
+    "\u6545\u4e8b\u5957\u88dd",
+    "\u5168\u65b0\u5957\u88dd",
+    "\u7cbe\u7dfb\u7bc0\u65e5\u5957\u88dd",
+    "\u7cbe\u7dfb\u5957\u88dd",
+    "\u6210\u5c31\u5957\u88dd",
+    "\u6536\u96c6\u5957\u88dd",
+    "\u5fa9\u523b\u5957\u88dd",
+    "\u5957\u88dd",
+)
+HIGH_CONFIDENCE_SUIT_LIST_PREFIX = re.compile(
+    r"(?:\u5957\u88dd\u70ba|\u6545\u4e8b\u5957\u88dd|\u5168\u65b0\u5957\u88dd|\u7cbe\u7dfb\u7bc0\u65e5\u5957\u88dd|"
+    r"\u7cbe\u7dfb\u5957\u88dd|\u6210\u5c31\u5957\u88dd|\u6536\u96c6\u5957\u88dd|\u5fa9\u523b\u5957\u88dd|\u5957\u88dd)"
+    r"\s*(?:\u3010[^\u3011]+\u3011\s*[\u3001\uff0c\u3001\u53ca\u548c\u8207]*)*$"
+)
 SUIT_GENERIC_NAMES = {"\u5957\u88dd", "\u90e8\u4ef6", "\u6d3b\u52d5", "\u734e\u52f5", "\u5fa9\u523b", "\u5957\u88dd\u90e8\u4ef6"}
-SUIT_RESOURCE_NAMES = {"\u9ad4\u529b", "\u91d1\u5e63", "\u947d\u77f3", "\u661f\u5149\u5e63", "\u661f\u947d", "\u6750\u6599"}
+SUIT_RESOURCE_NAMES = {"\u9ad4\u529b", "\u91d1\u5e63", "\u947d\u77f3", "\u661f\u5149\u5e63", "\u661f\u947d", "\u661f\u66dc\u77f3", "\u6750\u6599"}
 SUIT_FUNCTION_NAMES = {"\u4e00\u9375\u88fd\u8863", "\u514d\u8cbb\u6b21\u6578", "\u9ede\u64ca\u9818\u53d6", "\u524d\u5f80\u6d3b\u52d5"}
+REWARD_ITEM_MARKERS = ("部件", "材料", "資源", "道具", "票券")
 SUIT_PART_PREFIXES = tuple(
     "\u4e0b\u88dd\u00b7 \u4e0a\u8863\u00b7 \u9023\u8863\u88d9\u00b7 \u978b\u5b50\u00b7 \u9aee\u578b\u00b7 \u599d\u5bb9\u00b7 \u982d\u98fe\u00b7 \u896a\u5b50\u00b7 \u5916\u5957\u00b7 \u624b\u6301\u00b7 \u9818\u98fe\u00b7 \u8033\u98fe\u00b7 \u624b\u98fe\u00b7 \u8170\u98fe\u00b7 \u7279\u6b8a\u00b7".split()
 )
@@ -67,30 +84,82 @@ def is_valid_suit_name(name: str) -> bool:
     """Reject UI labels, resources, and individual clothing parts."""
     normalized = name.strip()
     invalid = SUIT_GENERIC_NAMES | SUIT_RESOURCE_NAMES | SUIT_FUNCTION_NAMES
-    if not normalized or normalized.isdecimal() or normalized in invalid:
+    if not normalized or normalized.isdecimal() or is_reward_item_name(normalized, invalid):
+        return False
+    if re.search(r"\*\s*\d+$", normalized):
         return False
     if normalized.startswith(SUIT_PART_PREFIXES):
         return False
     parts = [part.strip() for part in re.split(r"[\u3001,\uff0c/]", normalized) if part.strip()]
+    if is_reward_enumeration(parts, invalid):
+        return False
     return bool(parts) and not all(
-        part.isdecimal() or part in invalid or part.startswith(SUIT_PART_PREFIXES)
+        part.isdecimal() or is_reward_item_name(part, invalid) or part.startswith(SUIT_PART_PREFIXES)
         for part in parts
     )
 
 
+def is_reward_item_name(name: str, invalid: set[str]) -> bool:
+    """Identify a single resource or reward item, not a complete suit name."""
+    return name in invalid or any(marker in name for marker in REWARD_ITEM_MARKERS)
+
+
+def is_reward_enumeration(parts: list[str], invalid: set[str]) -> bool:
+    """Reject bracketed reward lists while preserving lists of actual suit names."""
+    if len(parts) < 2:
+        return False
+    reward_items = sum(
+        part.isdecimal() or is_reward_item_name(part, invalid) or part.startswith(SUIT_PART_PREFIXES)
+        for part in parts
+    )
+    return reward_items * 2 > len(parts)
+
+
+def has_high_confidence_suit_context(content: str, match: re.Match[str]) -> bool:
+    """Recognize official formats that explicitly attach a name to a full suit."""
+    prefix = content[max(0, match.start() - 48) : match.start()].rstrip()
+    suffix = content[match.end() : match.end() + 32].lstrip()
+    return (
+        prefix.endswith(HIGH_CONFIDENCE_SUIT_PREFIXES)
+        or HIGH_CONFIDENCE_SUIT_LIST_PREFIX.search(prefix) is not None
+        or suffix.startswith("\u5957\u88dd")
+    )
+
+
+def has_suit_acquisition_context(content: str, match: re.Match[str]) -> bool:
+    """Keep broad acquisition wording only when it also describes a suit."""
+    sentence_start = max(
+        content.rfind(separator, 0, match.start())
+        for separator in ("\n", "\u3002", "\uff01", "\uff1f", "\uff1b")
+    )
+    sentence_end_candidates = [
+        position
+        for separator in ("\n", "\u3002", "\uff01", "\uff1f", "\uff1b")
+        if (position := content.find(separator, match.end())) != -1
+    ]
+    sentence_end = min(sentence_end_candidates, default=len(content))
+    sentence = content[sentence_start + 1 : sentence_end]
+    return re.search(r"\u5957\u88dd(?!\s*\u90e8\u4ef6)", sentence) is not None and any(
+        keyword in sentence for keyword in SUIT_CONTEXT_KEYWORDS
+    )
+
+
 def parse_suits(content: str) -> list[SuitCandidate]:
-    """Return only bracketed names in an explicit full-suit acquisition context."""
+    """Return bracketed names only when the official text explicitly describes a suit."""
     suits: list[SuitCandidate] = []
     seen: set[str] = set()
     for match in re.finditer(r"\u3010([^\u3011]+)\u3011", content):
         name = match.group(1).strip()
-        context = content[max(0, match.start() - 48) : match.end() + 32]
         if name in seen or not is_valid_suit_name(name):
             continue
-        if not any(keyword in context for keyword in SUIT_CONTEXT_KEYWORDS):
+        if has_high_confidence_suit_context(content, match):
+            confidence = 1.0
+        elif has_suit_acquisition_context(content, match):
+            confidence = 0.9
+        else:
             continue
         seen.add(name)
-        suits.append(SuitCandidate(name=name, confidence=0.9))
+        suits.append(SuitCandidate(name=name, confidence=confidence))
     return suits
 
 
