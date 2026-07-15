@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from database.database import DATABASE_PATH, get_connection, initialize_knowledge_base_tables
 from scripts.data.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
+from scripts.data.fetch_website_posts import FetchWebsitePostsResult, fetch_and_save_website_posts
 from scripts.data.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
 from scripts.data.reset_database import ResetResult, reset_rebuildable_data
 
@@ -31,6 +32,7 @@ class RebuildResult:
     parse: ParseRawPostsResult
     event_count: int
     suit_count: int
+    website_fetch: FetchWebsitePostsResult | None = None
 
 
 def count_knowledge_records(database_path: Path) -> tuple[int, int]:
@@ -51,7 +53,9 @@ def rebuild_database(
     *,
     resetter: Callable[[Path], ResetResult] | None = None,
     fetcher: Callable[[int, Path], FetchRawPostsResult] = fetch_and_save_raw_posts,
+    website_fetcher: Callable[[int, Path], FetchWebsitePostsResult] = fetch_and_save_website_posts,
     parser: Callable[[int, Path], ParseRawPostsResult] = parse_pending_raw_posts,
+    include_website: bool = False,
 ) -> RebuildResult:
     """Refresh raw data and derived knowledge without destroying queue history."""
     reset = (
@@ -69,9 +73,12 @@ def rebuild_database(
             fetch.fetched_count,
             limit,
         )
-    parse = parser(limit, database_path)
+    website_fetch: FetchWebsitePostsResult | None = None
+    if include_website:
+        website_fetch = website_fetcher(limit, database_path)
+    parse = parser(limit * (2 if include_website else 1), database_path)
     event_count, suit_count = count_knowledge_records(database_path)
-    return RebuildResult(reset, fetch, parse, event_count, suit_count)
+    return RebuildResult(reset, fetch, parse, event_count, suit_count, website_fetch)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -79,6 +86,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="DANGEROUS: reset regenerable data, then fetch and parse Facebook posts."
     )
     parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument(
+        "--include-website",
+        action="store_true",
+        help="Also fetch official website notices into raw_posts before parsing. Never enqueues Discord announcements.",
+    )
     parser.add_argument(
         "--reset-announcements",
         action="store_true",
@@ -94,6 +106,12 @@ def print_summary(result: RebuildResult) -> None:
     print(f"Raw posts inserted: {storage.inserted}")
     print(f"Raw posts updated: {storage.updated}")
     print(f"Raw posts unchanged: {storage.unchanged}")
+    if result.website_fetch is not None:
+        website_storage = result.website_fetch.storage
+        print(f"Website raw posts fetched: {result.website_fetch.fetched_count}")
+        print(f"Website raw posts inserted: {website_storage.inserted}")
+        print(f"Website raw posts updated: {website_storage.updated}")
+        print(f"Website detail failures: {result.website_fetch.detail_failures}")
     print(f"Parse succeeded: {result.parse.succeeded}")
     print(f"Parse failed: {result.parse.failed}")
     print(f"Parse skipped: {result.parse.skipped}")
@@ -128,6 +146,7 @@ def main(
                     path, reset_announcements=args.reset_announcements
                 )
             ),
+            include_website=args.include_website,
         )
     )
     try:

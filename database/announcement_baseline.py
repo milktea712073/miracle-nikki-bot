@@ -49,7 +49,9 @@ def build_announcement_baseline_plan(
     missing_raw_urls = [
         url
         for url in urls
-        if connection.execute("SELECT 1 FROM raw_posts WHERE url = ?", (url,)).fetchone()
+        if connection.execute(
+            "SELECT 1 FROM raw_posts WHERE source = 'facebook' AND url = ?", (url,)
+        ).fetchone()
         is None
     ]
     if missing_raw_urls:
@@ -83,7 +85,7 @@ def apply_announcement_baseline(
         connection.execute("BEGIN")
         for url in plan.baseline_urls:
             raw_post = connection.execute(
-                "SELECT id FROM raw_posts WHERE url = ?", (url,)
+                "SELECT id FROM raw_posts WHERE source = 'facebook' AND url = ?", (url,)
             ).fetchone()
             connection.execute(
                 "INSERT OR IGNORE INTO announcement_jobs "

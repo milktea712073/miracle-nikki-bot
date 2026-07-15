@@ -211,14 +211,15 @@ def classify_content(title: str | None, content: str, has_suits: bool) -> str:
     return classify_content_from_emoji(title, content)
 
 
-def parse_announcement(content: str) -> ParseDraft:
+def parse_announcement(content: str, *, content_type_hint: str | None = None) -> ParseDraft:
+    """Parse announcement text, optionally honoring a source-neutral category hint."""
     title = first_nonempty_line(content)
     start_at, end_at = parse_period(content)
     suits = parse_suits(content)
     notes: list[str] = []
     if start_at is None:
         notes.append("No supported activity date range was found.")
-    content_type = classify_content(title, content, bool(suits))
+    content_type = content_type_hint or classify_content(title, content, bool(suits))
     if content_type == "suit_event" and not suits:
         notes.append("No high-confidence suit candidates were found.")
     return ParseDraft(

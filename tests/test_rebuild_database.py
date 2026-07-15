@@ -10,6 +10,7 @@ from crawler.models import Post
 from database.database import get_connection, init_database
 from database.raw_post_repository import RawPostBatchResult, RawPostRepository
 from scripts.data.fetch_raw_posts import FetchRawPostsResult, fetch_and_save_raw_posts
+from scripts.data.fetch_website_posts import FetchWebsitePostsResult
 from scripts.data.parse_raw_posts import ParseRawPostsResult, parse_pending_raw_posts
 from scripts.data.rebuild_database import RebuildResult, main, rebuild_database
 from scripts.data.reset_database import ResetResult
@@ -59,6 +60,25 @@ def test_rebuild_runs_reset_fetch_parse_in_order_and_passes_limit(monkeypatch, t
     assert calls == [("reset", None), ("fetch", 50), ("parse", 50)]
     assert result.event_count == 2
     assert result.suit_count == 3
+
+
+def test_rebuild_include_website_fetches_both_sources_without_queue_enqueue(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, int | None]] = []
+    monkeypatch.setattr("scripts.data.rebuild_database.count_knowledge_records", lambda _: (2, 3))
+
+    result = rebuild_database(
+        10,
+        tmp_path / "rebuild-website.db",
+        resetter=lambda _: calls.append(("reset", None)) or ResetResult((), (), True),
+        fetcher=lambda limit, _: calls.append(("facebook", limit)) or FetchRawPostsResult(10, RawPostBatchResult(inserted=10)),
+        website_fetcher=lambda limit, _: calls.append(("website", limit)) or FetchWebsitePostsResult(10, 0, RawPostBatchResult(inserted=10)),
+        parser=lambda limit, _: calls.append(("parse", limit)) or ParseRawPostsResult(20, 20, 0, 0, 0),
+        include_website=True,
+    )
+
+    assert calls == [("reset", None), ("facebook", 10), ("website", 10), ("parse", 20)]
+    assert result.website_fetch is not None
+    assert result.website_fetch.storage.inserted == 10
 
 
 def test_reset_failure_stops_fetch_and_parse(tmp_path: Path) -> None:

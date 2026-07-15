@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 SCRIPT_MODULES = (
     "scripts.data.fetch_raw_posts",
+    "scripts.data.fetch_website_posts",
     "scripts.data.parse_raw_posts",
     "scripts.data.reset_database",
     "scripts.data.rebuild_database",

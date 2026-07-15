@@ -128,7 +128,9 @@ class AnnouncementJobRepository:
             connection.execute("BEGIN")
             if self.is_initialized_in_connection(connection):
                 raise ValueError("Announcement queue is already initialized.")
-            rows = connection.execute("SELECT id, url FROM raw_posts ORDER BY id").fetchall()
+            rows = connection.execute(
+                "SELECT id, url FROM raw_posts WHERE source = 'facebook' ORDER BY id"
+            ).fetchall()
             pending_url_set = {canonical_announcement_url(url) for url in pending_urls}
             connection.executemany(
                 "INSERT OR IGNORE INTO announcement_jobs "
@@ -328,7 +330,8 @@ class AnnouncementJobRepository:
         try:
             connection.execute("BEGIN")
             raw_post = connection.execute(
-                "SELECT id, url FROM raw_posts WHERE url = ?", (canonical_announcement_url(post_url),)
+                "SELECT id, url FROM raw_posts WHERE source = 'facebook' AND url = ?",
+                (canonical_announcement_url(post_url),),
             ).fetchone()
             if raw_post is None:
                 connection.rollback()
@@ -392,7 +395,8 @@ class AnnouncementJobRepository:
             for announcement_id, post_url, content in rows:
                 canonical_url = canonical_announcement_url(str(post_url))
                 raw = connection.execute(
-                    "SELECT id FROM raw_posts WHERE url = ?", (canonical_url,)
+                    "SELECT id FROM raw_posts WHERE source = 'facebook' AND url = ?",
+                    (canonical_url,),
                 ).fetchone()
                 if raw is None:
                     continue

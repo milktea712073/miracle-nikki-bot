@@ -214,7 +214,7 @@ class ParseDraftRepository:
         self, limit: int, raw_post_id: int | None = None, force: bool = False
     ) -> list[dict[str, object]]:
         """List raw posts eligible for parser execution, newest first."""
-        where = ["source = 'facebook'"]
+        where: list[str] = []
         values: list[object] = []
         if raw_post_id is not None:
             where.append("id = ?")
@@ -225,13 +225,19 @@ class ParseDraftRepository:
         connection = self._connect()
         try:
             rows = connection.execute(
-                "SELECT id, content, source_post_id FROM raw_posts WHERE "
-                + " AND ".join(where)
+                "SELECT id, content, source_post_id, source, metadata_json FROM raw_posts"
+                + (" WHERE " + " AND ".join(where) if where else "")
                 + " ORDER BY published_at DESC LIMIT ?",
                 values,
             ).fetchall()
             return [
-                {"id": row[0], "content": row[1], "source_post_id": row[2]}
+                {
+                    "id": row[0],
+                    "content": row[1],
+                    "source_post_id": row[2],
+                    "source": row[3],
+                    "metadata_json": row[4],
+                }
                 for row in rows
             ]
         finally:

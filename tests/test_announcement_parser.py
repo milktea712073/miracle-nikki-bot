@@ -171,3 +171,12 @@ def test_suit_parser_keeps_high_confidence_suit_lists_while_rejecting_reward_lis
 
     assert [suit.name for suit in draft.suits] == ["\u7562\u6708\u70cf", "\u89d2\u6728\u86df", "\u6696\u5fc3\u871c\u610f", "\u6d77\u6c99\u66a2\u60f3"]
     assert all(suit.confidence == 1.0 for suit in draft.suits)
+
+
+def test_source_neutral_content_type_hint_has_priority_over_text_classification():
+    draft = parse_announcement(
+        "【活動】測試公告\n活動時間：2026年7月16日05:00 - 2026年7月25日23:59",
+        content_type_hint="system",
+    )
+
+    assert draft.content_type_candidate == "system"

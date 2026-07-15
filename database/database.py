@@ -46,7 +46,7 @@ def ensure_database_initialized(database_path: Path | None = None) -> None:
 
 
 def initialize_raw_tables(connection: sqlite3.Connection) -> None:
-    """Create raw Facebook post tables without modifying existing tables."""
+    """Create source-agnostic raw post tables without modifying existing rows."""
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS raw_posts (
@@ -61,6 +61,7 @@ def initialize_raw_tables(connection: sqlite3.Connection) -> None:
             parse_status TEXT NOT NULL DEFAULT 'pending',
             parse_error TEXT,
             content_hash TEXT,
+            metadata_json TEXT,
             UNIQUE(source, source_post_id)
         );
 
@@ -79,6 +80,11 @@ def initialize_raw_tables(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_raw_posts_parse_status ON raw_posts(parse_status);
         """
     )
+    raw_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(raw_posts)").fetchall()
+    }
+    if "metadata_json" not in raw_columns:
+        connection.execute("ALTER TABLE raw_posts ADD COLUMN metadata_json TEXT")
     connection.commit()
 
 

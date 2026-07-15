@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sqlite3
 import sys
@@ -50,7 +51,12 @@ def parse_pending_raw_posts(
     succeeded = failed = needs_review = 0
     for raw_post in raw_posts:
         try:
-            draft = parse_announcement(str(raw_post["content"]))
+            metadata = json.loads(str(raw_post["metadata_json"])) if raw_post["metadata_json"] else {}
+            content_type_hint = metadata.get("content_type_candidate")
+            draft = parse_announcement(
+                str(raw_post["content"]),
+                content_type_hint=str(content_type_hint) if content_type_hint else None,
+            )
             saved = repository.save_parse_draft(int(raw_post["id"]), parser_version, draft)
             imported = auto_import_parse_draft(saved.parse_draft_id, database_path)
             succeeded += 1

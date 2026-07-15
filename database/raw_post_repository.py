@@ -1,4 +1,4 @@
-"""SQLite persistence for raw Facebook posts."""
+"""SQLite persistence for source-agnostic raw posts."""
 
 import hashlib
 import json
@@ -18,6 +18,7 @@ from database.database import ensure_database_initialized, get_connection
 
 LOGGER = logging.getLogger(__name__)
 SOURCE_FACEBOOK = "facebook"
+SOURCE_WEBSITE = "website"
 SaveAction = Literal["inserted", "updated", "unchanged"]
 
 
@@ -97,6 +98,7 @@ def compute_content_hash(post: Post) -> str:
         "images": [image_hash_value(image_url) for image_url in unique_images(post.images)],
         "published_at": to_iso8601(post.published_at),
         "url": canonical_announcement_url(post.url),
+        "metadata": post.metadata or {},
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -112,17 +114,19 @@ class RawPostRepository:
     def _connect(self) -> sqlite3.Connection:
         return get_connection(self._database_path)
 
-    def raw_post_exists(self, source_post_id: str) -> bool:
-        """Return whether a Facebook post was already persisted."""
-        return self.get_raw_post_by_source_id(source_post_id) is not None
+    def raw_post_exists(self, source_post_id: str, *, source: str = SOURCE_FACEBOOK) -> bool:
+        """Return whether one source-specific post was already persisted."""
+        return self.get_raw_post_by_source_id(source_post_id, source=source) is not None
 
-    def get_raw_post_by_source_id(self, source_post_id: str) -> dict[str, object] | None:
+    def get_raw_post_by_source_id(
+        self, source_post_id: str, *, source: str = SOURCE_FACEBOOK
+    ) -> dict[str, object] | None:
         """Return a raw post and ordered images, or None when it is absent."""
         connection = self._connect()
         try:
             row = connection.execute(
                 "SELECT * FROM raw_posts WHERE source = ? AND source_post_id = ?",
-                (SOURCE_FACEBOOK, source_post_id),
+                (source, source_post_id),
             ).fetchone()
             if row is None:
                 return None
@@ -136,6 +140,8 @@ class RawPostRepository:
             ).description]
             result = dict(zip(columns, row, strict=True))
             result["images"] = [image[0] for image in images]
+            metadata_json = result.get("metadata_json")
+            result["metadata"] = json.loads(metadata_json) if metadata_json else None
             return result
         finally:
             connection.close()
@@ -155,11 +161,15 @@ class RawPostRepository:
     def save_raw_post(
         self, post: Post, *, enqueue_announcement: bool = True
     ) -> RawPostSaveResult:
-        """Insert or update a raw Facebook post in one transaction."""
+        """Insert or update a raw post in one transaction."""
+        source = post.source.strip().lower()
+        if not source:
+            raise ValueError("Post.source must not be empty.")
         published_at = to_iso8601(post.published_at)
         images = unique_images(post.images)
         content_hash = compute_content_hash(post)
         post_url = canonical_announcement_url(post.url)
+        metadata_json = json.dumps(post.metadata, ensure_ascii=False, sort_keys=True) if post.metadata else None
         now = utc_now_iso8601()
         connection = self._connect()
         try:
@@ -167,7 +177,7 @@ class RawPostRepository:
             existing = connection.execute(
                 "SELECT id, content_hash FROM raw_posts "
                 "WHERE source = ? AND source_post_id = ?",
-                (SOURCE_FACEBOOK, post.post_id),
+                (source, post.post_id),
             ).fetchone()
 
             if existing is not None and existing[1] == content_hash:
@@ -177,10 +187,10 @@ class RawPostRepository:
             if existing is None:
                 cursor = connection.execute(
                     "INSERT INTO raw_posts (source, source_post_id, url, content, published_at, "
-                    "scraped_at, updated_at, parse_status, parse_error, content_hash) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)",
+                    "scraped_at, updated_at, parse_status, parse_error, content_hash, metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)",
                     (
-                        SOURCE_FACEBOOK,
+                        source,
                         post.post_id,
                         post_url,
                         post.content,
@@ -188,24 +198,26 @@ class RawPostRepository:
                         now,
                         now,
                         content_hash,
+                        metadata_json,
                     ),
                 )
                 raw_post_id = int(cursor.lastrowid)
                 action: SaveAction = "inserted"
-                AnnouncementJobRepository.create_pending_for_new_raw_post(
-                    connection,
-                    raw_post_id,
-                    post_url,
-                    now,
-                    enqueue=enqueue_announcement,
-                )
+                if source == SOURCE_FACEBOOK:
+                    AnnouncementJobRepository.create_pending_for_new_raw_post(
+                        connection,
+                        raw_post_id,
+                        post_url,
+                        now,
+                        enqueue=enqueue_announcement,
+                    )
             else:
                 raw_post_id = int(existing[0])
                 connection.execute(
                     "UPDATE raw_posts SET url = ?, content = ?, published_at = ?, "
                     "updated_at = ?, parse_status = 'pending', parse_error = NULL, "
-                    "content_hash = ? WHERE id = ?",
-                    (post_url, post.content, published_at, now, content_hash, raw_post_id),
+                    "content_hash = ?, metadata_json = ? WHERE id = ?",
+                    (post_url, post.content, published_at, now, content_hash, metadata_json, raw_post_id),
                 )
                 connection.execute(
                     "DELETE FROM raw_post_images WHERE raw_post_id = ?", (raw_post_id,)
@@ -233,9 +245,9 @@ class RawPostRepository:
                 )
             except Exception as error:
                 if isinstance(error, sqlite3.OperationalError) and "locked" in str(error).lower():
-                    LOGGER.warning("Database is locked while saving raw Facebook post %s", post.post_id)
+                    LOGGER.warning("Database is locked while saving raw %s post %s", post.source, post.post_id)
                 else:
-                    LOGGER.exception("Failed to save raw Facebook post %s", post.post_id)
+                    LOGGER.exception("Failed to save raw %s post %s", post.source, post.post_id)
                 result.failures.append(RawPostFailure(post.post_id, str(error)))
                 continue
 
@@ -258,11 +270,13 @@ def save_raw_posts(posts: list[Post]) -> RawPostBatchResult:
     return RawPostRepository().save_raw_posts(posts)
 
 
-def get_raw_post_by_source_id(source_post_id: str) -> dict[str, object] | None:
-    """Fetch a raw Facebook post from the configured project database."""
-    return RawPostRepository().get_raw_post_by_source_id(source_post_id)
+def get_raw_post_by_source_id(
+    source_post_id: str, *, source: str = SOURCE_FACEBOOK
+) -> dict[str, object] | None:
+    """Fetch one source-specific raw post from the configured project database."""
+    return RawPostRepository().get_raw_post_by_source_id(source_post_id, source=source)
 
 
-def raw_post_exists(source_post_id: str) -> bool:
-    """Check for a raw Facebook post in the configured project database."""
-    return RawPostRepository().raw_post_exists(source_post_id)
+def raw_post_exists(source_post_id: str, *, source: str = SOURCE_FACEBOOK) -> bool:
+    """Check for a source-specific raw post in the configured project database."""
+    return RawPostRepository().raw_post_exists(source_post_id, source=source)
