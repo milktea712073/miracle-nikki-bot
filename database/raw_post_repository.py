@@ -11,6 +11,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from crawler.models import Post
+from database.announcement_identity import canonical_announcement_url
 from database.announcement_job_repository import AnnouncementJobRepository
 from database.database import ensure_database_initialized, get_connection
 
@@ -95,7 +96,7 @@ def compute_content_hash(post: Post) -> str:
         "content": post.content,
         "images": [image_hash_value(image_url) for image_url in unique_images(post.images)],
         "published_at": to_iso8601(post.published_at),
-        "url": post.url,
+        "url": canonical_announcement_url(post.url),
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -151,11 +152,14 @@ class RawPostRepository:
             ],
         )
 
-    def save_raw_post(self, post: Post) -> RawPostSaveResult:
+    def save_raw_post(
+        self, post: Post, *, enqueue_announcement: bool = True
+    ) -> RawPostSaveResult:
         """Insert or update a raw Facebook post in one transaction."""
         published_at = to_iso8601(post.published_at)
         images = unique_images(post.images)
         content_hash = compute_content_hash(post)
+        post_url = canonical_announcement_url(post.url)
         now = utc_now_iso8601()
         connection = self._connect()
         try:
@@ -178,7 +182,7 @@ class RawPostRepository:
                     (
                         SOURCE_FACEBOOK,
                         post.post_id,
-                        post.url,
+                        post_url,
                         post.content,
                         published_at,
                         now,
@@ -189,7 +193,11 @@ class RawPostRepository:
                 raw_post_id = int(cursor.lastrowid)
                 action: SaveAction = "inserted"
                 AnnouncementJobRepository.create_pending_for_new_raw_post(
-                    connection, raw_post_id, now
+                    connection,
+                    raw_post_id,
+                    post_url,
+                    now,
+                    enqueue=enqueue_announcement,
                 )
             else:
                 raw_post_id = int(existing[0])
@@ -197,7 +205,7 @@ class RawPostRepository:
                     "UPDATE raw_posts SET url = ?, content = ?, published_at = ?, "
                     "updated_at = ?, parse_status = 'pending', parse_error = NULL, "
                     "content_hash = ? WHERE id = ?",
-                    (post.url, post.content, published_at, now, content_hash, raw_post_id),
+                    (post_url, post.content, published_at, now, content_hash, raw_post_id),
                 )
                 connection.execute(
                     "DELETE FROM raw_post_images WHERE raw_post_id = ?", (raw_post_id,)
@@ -213,12 +221,16 @@ class RawPostRepository:
         finally:
             connection.close()
 
-    def save_raw_posts(self, posts: list[Post]) -> RawPostBatchResult:
+    def save_raw_posts(
+        self, posts: list[Post], *, enqueue_announcements: bool = True
+    ) -> RawPostBatchResult:
         """Persist posts independently so one failing post does not stop the batch."""
         result = RawPostBatchResult()
         for post in posts:
             try:
-                saved = self.save_raw_post(post)
+                saved = self.save_raw_post(
+                    post, enqueue_announcement=enqueue_announcements
+                )
             except Exception as error:
                 if isinstance(error, sqlite3.OperationalError) and "locked" in str(error).lower():
                     LOGGER.warning("Database is locked while saving raw Facebook post %s", post.post_id)

@@ -66,7 +66,7 @@ def test_parse_success_auto_imports_data_that_is_immediately_queryable(tmp_path:
     assert suit.data_status == "auto"
 
 
-def test_auto_import_reuses_records_and_can_fill_new_suits(tmp_path: Path) -> None:
+def test_auto_import_keeps_same_named_events_from_distinct_raw_posts_separate(tmp_path: Path) -> None:
     database_path = tmp_path / "auto-upsert.db"
     first_id = save_draft(database_path, draft_with_candidates(suits=["元氣應援"]), "post-1")
     second_id = save_draft(
@@ -80,13 +80,10 @@ def test_auto_import_reuses_records_and_can_fill_new_suits(tmp_path: Path) -> No
 
     connection = get_connection(database_path)
     try:
-        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM suits").fetchone()[0] == 2
-        assert connection.execute("SELECT COUNT(*) FROM event_suits").fetchone()[0] == 2
-        assert connection.execute("SELECT COUNT(*) FROM event_periods").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT description FROM events WHERE name = ?", ("奇迹演唱會",)
-        ).fetchone()[0] == "奇迹演唱會 更新公告"
+        assert connection.execute("SELECT COUNT(*) FROM event_suits").fetchone()[0] == 3
+        assert connection.execute("SELECT COUNT(*) FROM event_periods").fetchone()[0] == 2
     finally:
         connection.close()
 
@@ -109,7 +106,7 @@ def test_verified_event_is_not_overwritten_by_later_parser_output(tmp_path: Path
     finally:
         connection.close()
 
-    second_id = save_draft(database_path, draft_with_candidates("Parser 新標題"), "post-2")
+    second_id = save_draft(database_path, draft_with_candidates("Parser 新標題"), "post-1")
     auto_import_parse_draft(second_id, database_path)
 
     connection = get_connection(database_path)

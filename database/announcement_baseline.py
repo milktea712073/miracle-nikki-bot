@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from database.announcement_identity import canonical_announcement_url
 from database.database import announcement_exists
 
 
@@ -25,7 +26,7 @@ def _unique_urls(post_urls: list[str]) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     for raw_url in post_urls:
-        url = raw_url.strip()
+        url = canonical_announcement_url(raw_url)
         if url and url not in seen:
             urls.append(url)
             seen.add(url)
@@ -39,7 +40,7 @@ def build_announcement_baseline_plan(
 ) -> AnnouncementBaselinePlan:
     """Validate explicit current-cycle URLs before marking historical ones skipped."""
     urls = _unique_urls(candidate_urls)
-    excluded_url = excluded_url.strip()
+    excluded_url = canonical_announcement_url(excluded_url)
     if not excluded_url:
         raise ValueError("A post URL to keep pending is required.")
     if excluded_url not in urls:
@@ -86,9 +87,9 @@ def apply_announcement_baseline(
             ).fetchone()
             connection.execute(
                 "INSERT OR IGNORE INTO announcement_jobs "
-                "(raw_post_id, status, attempt_count, created_at, updated_at) "
-                "VALUES (?, 'skipped', 0, datetime('now'), datetime('now'))",
-                (int(raw_post[0]),),
+                "(raw_post_id, post_url, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'skipped', 0, datetime('now'), datetime('now'))",
+                (int(raw_post[0]), url),
             )
         connection.commit()
         return len(plan.baseline_urls)

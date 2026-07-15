@@ -4,6 +4,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from database.announcement_identity import canonical_announcement_url
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATABASE_PATH = PROJECT_ROOT / "database" / "database.db"
@@ -91,7 +93,8 @@ def initialize_announcement_queue_tables(connection: sqlite3.Connection) -> None
 
         CREATE TABLE IF NOT EXISTS announcement_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            raw_post_id INTEGER NOT NULL,
+            raw_post_id INTEGER,
+            post_url TEXT NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'sending', 'sent', 'skipped', 'failed')),
             attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -99,8 +102,7 @@ def initialize_announcement_queue_tables(connection: sqlite3.Connection) -> None
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             sent_at TEXT,
-            FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE CASCADE,
-            UNIQUE(raw_post_id)
+            FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE SET NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_announcement_jobs_status_created
@@ -108,6 +110,89 @@ def initialize_announcement_queue_tables(connection: sqlite3.Connection) -> None
         """
     )
     connection.commit()
+    _migrate_announcement_jobs_to_stable_identity(connection)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_announcement_jobs_raw_post_id "
+        "ON announcement_jobs(raw_post_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_announcement_jobs_status_created "
+        "ON announcement_jobs(status, created_at)"
+    )
+    connection.commit()
+
+
+def _migrate_announcement_jobs_to_stable_identity(connection: sqlite3.Connection) -> None:
+    """Preserve queue states while replacing volatile raw IDs as the job key."""
+    columns = {
+        str(row[1]): bool(row[3])
+        for row in connection.execute("PRAGMA table_info(announcement_jobs)")
+    }
+    foreign_keys = connection.execute("PRAGMA foreign_key_list(announcement_jobs)").fetchall()
+    uses_set_null = any(
+        row[2] == "raw_posts" and str(row[6]).upper() == "SET NULL"
+        for row in foreign_keys
+    )
+    if "post_url" in columns and not columns.get("raw_post_id", True) and uses_set_null:
+        return
+
+    rows = connection.execute(
+        """
+        SELECT j.id, j.raw_post_id, r.url, j.status, j.attempt_count, j.last_error,
+               j.created_at, j.updated_at, j.sent_at
+        FROM announcement_jobs AS j
+        LEFT JOIN raw_posts AS r ON r.id = j.raw_post_id
+        ORDER BY j.id
+        """
+    ).fetchall()
+    priority = {"sent": 5, "skipped": 4, "failed": 3, "sending": 2, "pending": 1}
+    retained: dict[str, tuple[object, ...]] = {}
+    for row in rows:
+        post_url = canonical_announcement_url(str(row[2])) if row[2] else f"orphaned-job:{row[0]}"
+        existing = retained.get(post_url)
+        if existing is None or priority.get(str(row[3]), 0) > priority.get(str(existing[3]), 0):
+            retained[post_url] = (*row[:2], post_url, *row[3:])
+
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.execute(
+            """
+            CREATE TABLE announcement_jobs_rebuilt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_post_id INTEGER,
+                post_url TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'sending', 'sent', 'skipped', 'failed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sent_at TEXT,
+                FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE SET NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO announcement_jobs_rebuilt (
+                id, raw_post_id, post_url, status, attempt_count, last_error,
+                created_at, updated_at, sent_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            retained.values(),
+        )
+        connection.execute("DROP TABLE announcement_jobs")
+        connection.execute("ALTER TABLE announcement_jobs_rebuilt RENAME TO announcement_jobs")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def initialize_parse_draft_tables(connection: sqlite3.Connection) -> None:
@@ -179,7 +264,7 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
             official_series TEXT,
             event_type_id INTEGER,
             description TEXT,
@@ -251,6 +336,15 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
         """
     )
     _initialize_knowledge_provenance_columns(connection)
+    # Earlier databases used ``events.name`` as a unique key.  Activity names are
+    # display data, however: separate official posts can legitimately have the
+    # same name.  Preserve all rows while removing that legacy uniqueness rule.
+    connection.commit()
+    _migrate_events_name_unique_constraint(connection)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_source_raw_post_id "
+        "ON events(source_raw_post_id)"
+    )
     connection.commit()
 
 
@@ -308,6 +402,81 @@ def _initialize_knowledge_provenance_columns(connection: sqlite3.Connection) -> 
     connection.execute(
         "UPDATE suits SET created_via = 'auto' WHERE created_via = 'parser' AND data_status = 'auto'"
     )
+
+
+def _migrate_events_name_unique_constraint(connection: sqlite3.Connection) -> None:
+    """Remove the legacy unique event-name constraint without losing knowledge data."""
+    unique_name_index = _find_unique_name_index(connection, "events")
+    if unique_name_index is None:
+        return
+
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.executescript(
+            """
+            BEGIN;
+            CREATE TABLE events_rebuilt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                official_series TEXT,
+                event_type_id INTEGER,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                content_type TEXT NOT NULL DEFAULT 'event',
+                event_status TEXT,
+                is_visible INTEGER NOT NULL DEFAULT 1,
+                data_status TEXT NOT NULL DEFAULT 'auto',
+                source_raw_post_id INTEGER,
+                created_via TEXT NOT NULL DEFAULT 'auto',
+                updated_via TEXT NOT NULL DEFAULT 'auto',
+                FOREIGN KEY (event_type_id) REFERENCES event_types(id)
+            );
+
+            INSERT INTO events_rebuilt (
+                id, name, official_series, event_type_id, description, created_at,
+                updated_at, content_type, event_status, is_visible, data_status,
+                source_raw_post_id, created_via, updated_via
+            )
+            SELECT
+                id, name, official_series, event_type_id, description, created_at,
+                updated_at, content_type, event_status, is_visible, data_status,
+                source_raw_post_id, created_via, updated_via
+            FROM events;
+
+            DROP TABLE events;
+            ALTER TABLE events_rebuilt RENAME TO events;
+            COMMIT;
+            """
+        )
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _find_unique_name_index(
+    connection: sqlite3.Connection, table_name: str
+) -> str | None:
+    """Return a single-column UNIQUE index for ``name``, if the table has one."""
+    for row in connection.execute(f"PRAGMA index_list({table_name})"):
+        index_name, is_unique = str(row[1]), bool(row[2])
+        if not is_unique:
+            continue
+        escaped_index_name = index_name.replace('"', '""')
+        columns = [
+            str(column[2])
+            for column in connection.execute(
+                f'PRAGMA index_info("{escaped_index_name}")'
+            )
+        ]
+        if columns == ["name"]:
+            return index_name
+    return None
 
 
 def initialize_review_tables(connection: sqlite3.Connection) -> None:

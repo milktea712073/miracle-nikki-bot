@@ -49,6 +49,15 @@ class FakeRepository:
     def get_announcement_image_for_event(self, _name: str) -> None:
         return None
 
+    def get_events_by_name(self, _name: str) -> list[EventView]:
+        return [EventView(1, "測試活動", None, None, None, [], [], None, None)]
+
+    def get_queryable_event_by_id(self, event_id: int) -> EventView | None:
+        return EventView(event_id, "測試活動", None, None, None, [], [], None, None)
+
+    def get_announcement_image_for_event_id(self, _event_id: int) -> None:
+        return None
+
     def get_suit_by_name(self, _name: str) -> SuitView:
         return SuitView(2, "測試套裝", None, False, None, [])
 

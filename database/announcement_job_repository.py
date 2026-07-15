@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from database.announcement_identity import canonical_announcement_url
 from database.database import ensure_database_initialized, get_connection
 
 
@@ -41,6 +42,12 @@ class RequeueResult:
     post_url: str
 
 
+@dataclass(frozen=True, slots=True)
+class AnnouncementQueueRepairPlan:
+    jobs_to_skip: tuple[AnnouncementJob, ...]
+    jobs_to_keep_pending: tuple[AnnouncementJob, ...]
+
+
 class AnnouncementJobRepository:
     """Keep announcement queue state independent from crawler polling order."""
 
@@ -59,16 +66,51 @@ class AnnouncementJobRepository:
 
     @staticmethod
     def create_pending_for_new_raw_post(
-        connection: sqlite3.Connection, raw_post_id: int, now: str
+        connection: sqlite3.Connection,
+        raw_post_id: int,
+        post_url: str,
+        now: str,
+        *,
+        enqueue: bool = True,
     ) -> None:
-        """Enqueue only newly inserted raw posts after queue initialization."""
-        if not AnnouncementJobRepository.is_initialized_in_connection(connection):
+        """Link known delivery state or enqueue one newly discovered post URL."""
+        canonical_url = canonical_announcement_url(post_url)
+        existing = connection.execute(
+            "SELECT id FROM announcement_jobs WHERE post_url = ?", (canonical_url,)
+        ).fetchone()
+        if existing is not None:
+            connection.execute(
+                "UPDATE announcement_jobs SET raw_post_id = ?, updated_at = ? WHERE id = ?",
+                (raw_post_id, now, int(existing[0])),
+            )
             return
+        if not AnnouncementJobRepository.is_initialized_in_connection(connection) or not enqueue:
+            return
+        sent = AnnouncementJobRepository._announcement_exists_in_connection(
+            connection, canonical_url
+        )
         connection.execute(
-            "INSERT OR IGNORE INTO announcement_jobs "
-            "(raw_post_id, status, attempt_count, created_at, updated_at) "
-            "VALUES (?, 'pending', 0, ?, ?)",
-            (raw_post_id, now, now),
+            "INSERT INTO announcement_jobs "
+            "(raw_post_id, post_url, status, attempt_count, created_at, updated_at, sent_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                raw_post_id,
+                canonical_url,
+                "sent" if sent else "pending",
+                1 if sent else 0,
+                now,
+                now,
+                now if sent else None,
+            ),
+        )
+
+    @staticmethod
+    def _announcement_exists_in_connection(
+        connection: sqlite3.Connection, canonical_url: str
+    ) -> bool:
+        return any(
+            canonical_announcement_url(str(row[0])) == canonical_url
+            for row in connection.execute("SELECT post_url FROM announcements")
         )
 
     def is_initialized(self) -> bool:
@@ -87,15 +129,18 @@ class AnnouncementJobRepository:
             if self.is_initialized_in_connection(connection):
                 raise ValueError("Announcement queue is already initialized.")
             rows = connection.execute("SELECT id, url FROM raw_posts ORDER BY id").fetchall()
-            pending_url_set = set(pending_urls)
+            pending_url_set = {canonical_announcement_url(url) for url in pending_urls}
             connection.executemany(
                 "INSERT OR IGNORE INTO announcement_jobs "
-                "(raw_post_id, status, attempt_count, created_at, updated_at) "
-                "VALUES (?, ?, 0, ?, ?)",
+                "(raw_post_id, post_url, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, ?, ?)",
                 [
                     (
                         int(row[0]),
-                        "pending" if str(row[1]) in pending_url_set else "skipped",
+                        canonical_announcement_url(str(row[1])),
+                        "pending"
+                        if canonical_announcement_url(str(row[1])) in pending_url_set
+                        else "skipped",
                         now,
                         now,
                     )
@@ -129,6 +174,48 @@ class AnnouncementJobRepository:
         finally:
             connection.close()
 
+    def plan_rebuild_repair(
+        self, keep_pending_urls: tuple[str, ...]
+    ) -> AnnouncementQueueRepairPlan:
+        """List retryable jobs before an operator marks rebuild history skipped."""
+        keep_urls = {canonical_announcement_url(url) for url in keep_pending_urls}
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id FROM announcement_jobs WHERE raw_post_id IS NOT NULL "
+                "AND status IN ('pending', 'failed', 'sending') ORDER BY created_at, id"
+            ).fetchall()
+        finally:
+            connection.close()
+        jobs = tuple(
+            job for row in rows if (job := self.get_job(int(row[0]))) is not None
+        )
+        return AnnouncementQueueRepairPlan(
+            jobs_to_skip=tuple(job for job in jobs if job.post_url not in keep_urls),
+            jobs_to_keep_pending=tuple(job for job in jobs if job.post_url in keep_urls),
+        )
+
+    def apply_rebuild_repair(self, plan: AnnouncementQueueRepairPlan) -> int:
+        """Mark only a reviewed set of retryable rebuild jobs as skipped."""
+        if not plan.jobs_to_skip:
+            return 0
+        connection = self._connect()
+        now = utc_now()
+        try:
+            connection.execute("BEGIN")
+            connection.executemany(
+                "UPDATE announcement_jobs SET status = 'skipped', last_error = NULL, "
+                "updated_at = ? WHERE id = ? AND status IN ('pending', 'failed', 'sending')",
+                [(now, job.id) for job in plan.jobs_to_skip],
+            )
+            connection.commit()
+            return len(plan.jobs_to_skip)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def claim_jobs(self, limit: int) -> list[AnnouncementJob]:
         """Atomically claim up to ``limit`` pending or failed jobs in creation order."""
         if limit < 1:
@@ -138,7 +225,8 @@ class AnnouncementJobRepository:
         try:
             connection.execute("BEGIN")
             rows = connection.execute(
-                "SELECT id FROM announcement_jobs WHERE status IN ('pending', 'failed') "
+                "SELECT id FROM announcement_jobs WHERE raw_post_id IS NOT NULL "
+                "AND status IN ('pending', 'failed') "
                 "ORDER BY created_at ASC, id ASC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -162,7 +250,7 @@ class AnnouncementJobRepository:
         try:
             row = connection.execute(
                 "SELECT j.id, j.raw_post_id, j.status, j.attempt_count, j.last_error, "
-                "j.created_at, j.updated_at, j.sent_at, r.url, r.content, r.published_at "
+                "j.created_at, j.updated_at, j.sent_at, j.post_url, r.content, r.published_at "
                 "FROM announcement_jobs j JOIN raw_posts r ON r.id = j.raw_post_id WHERE j.id = ?",
                 (job_id,),
             ).fetchone()
@@ -200,16 +288,13 @@ class AnnouncementJobRepository:
         try:
             connection.execute("BEGIN")
             row = connection.execute(
-                "SELECT r.url, r.content, r.published_at FROM announcement_jobs j "
+                "SELECT j.post_url, r.content, r.published_at FROM announcement_jobs j "
                 "JOIN raw_posts r ON r.id = j.raw_post_id WHERE j.id = ?",
                 (job_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"Announcement job {job_id} does not exist.")
-            announcement = connection.execute(
-                "SELECT id FROM announcements WHERE post_url = ?", (str(row[0]),)
-            ).fetchone()
-            if announcement is None:
+            if not self._announcement_exists_in_connection(connection, str(row[0])):
                 cursor = connection.execute(
                     "INSERT INTO announcements (publish_time, content, post_url) VALUES (?, ?, ?)",
                     (str(row[2] or ""), str(row[1]), str(row[0])),
@@ -243,22 +328,22 @@ class AnnouncementJobRepository:
         try:
             connection.execute("BEGIN")
             raw_post = connection.execute(
-                "SELECT id, url FROM raw_posts WHERE url = ?", (post_url,)
+                "SELECT id, url FROM raw_posts WHERE url = ?", (canonical_announcement_url(post_url),)
             ).fetchone()
             if raw_post is None:
                 connection.rollback()
                 return None
             raw_post_id = int(raw_post[0])
             existing = connection.execute(
-                "SELECT id, status FROM announcement_jobs WHERE raw_post_id = ?",
-                (raw_post_id,),
+                "SELECT id, status FROM announcement_jobs WHERE post_url = ?",
+                (canonical_announcement_url(str(raw_post[1])),),
             ).fetchone()
             if existing is None:
                 cursor = connection.execute(
                     "INSERT INTO announcement_jobs "
-                    "(raw_post_id, status, attempt_count, last_error, created_at, updated_at, sent_at) "
-                    "VALUES (?, 'pending', 0, NULL, ?, ?, NULL)",
-                    (raw_post_id, now, now),
+                    "(raw_post_id, post_url, status, attempt_count, last_error, created_at, updated_at, sent_at) "
+                    "VALUES (?, ?, 'pending', 0, NULL, ?, ?, NULL)",
+                    (raw_post_id, canonical_announcement_url(str(raw_post[1])), now, now),
                 )
                 job_id = int(cursor.lastrowid)
                 old_status = None
@@ -267,8 +352,8 @@ class AnnouncementJobRepository:
                 old_status = str(existing[1])
                 connection.execute(
                     "UPDATE announcement_jobs SET status = 'pending', attempt_count = 0, "
-                    "last_error = NULL, sent_at = NULL, updated_at = ? WHERE id = ?",
-                    (now, job_id),
+                    "last_error = NULL, sent_at = NULL, raw_post_id = ?, updated_at = ? WHERE id = ?",
+                    (raw_post_id, now, job_id),
                 )
             connection.commit()
             return RequeueResult(raw_post_id, job_id, old_status, str(raw_post[1]))
@@ -283,10 +368,9 @@ class AnnouncementJobRepository:
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT a.post_url FROM announcements a "
-                "JOIN raw_posts r ON r.url = a.post_url "
-                "LEFT JOIN announcement_jobs j ON j.raw_post_id = r.id "
-                "WHERE a.content NOT LIKE ? AND COALESCE(j.status, 'sent') != 'skipped' "
+            "SELECT a.post_url FROM announcements a "
+            "LEFT JOIN announcement_jobs j ON j.post_url = a.post_url "
+            "WHERE a.content NOT LIKE ? AND COALESCE(j.status, 'sent') != 'skipped' "
                 "ORDER BY CASE WHEN j.sent_at IS NULL THEN 1 ELSE 0 END, "
                 "j.sent_at DESC, a.id DESC LIMIT 1",
                 (f"{BASELINE_CONTENT_PREFIX}%",),
@@ -306,8 +390,9 @@ class AnnouncementJobRepository:
                 "SELECT id, post_url, content FROM announcements ORDER BY id"
             ).fetchall()
             for announcement_id, post_url, content in rows:
+                canonical_url = canonical_announcement_url(str(post_url))
                 raw = connection.execute(
-                    "SELECT id FROM raw_posts WHERE url = ?", (str(post_url),)
+                    "SELECT id FROM raw_posts WHERE url = ?", (canonical_url,)
                 ).fetchone()
                 if raw is None:
                     continue
@@ -315,9 +400,9 @@ class AnnouncementJobRepository:
                 if str(content).startswith(BASELINE_CONTENT_PREFIX):
                     cursor = connection.execute(
                         "INSERT OR IGNORE INTO announcement_jobs "
-                        "(raw_post_id, status, attempt_count, created_at, updated_at) "
-                        "VALUES (?, 'skipped', 0, ?, ?)",
-                        (raw_post_id, now, now),
+                        "(raw_post_id, post_url, status, attempt_count, created_at, updated_at) "
+                        "VALUES (?, ?, 'skipped', 0, ?, ?)",
+                        (raw_post_id, canonical_url, now, now),
                     )
                     connection.execute("DELETE FROM images WHERE announcement_id = ?", (announcement_id,))
                     connection.execute("DELETE FROM announcements WHERE id = ?", (announcement_id,))
@@ -325,9 +410,9 @@ class AnnouncementJobRepository:
                 else:
                     cursor = connection.execute(
                         "INSERT OR IGNORE INTO announcement_jobs "
-                        "(raw_post_id, status, attempt_count, created_at, updated_at, sent_at) "
-                        "VALUES (?, 'sent', 1, ?, ?, ?)",
-                        (raw_post_id, now, now, now),
+                        "(raw_post_id, post_url, status, attempt_count, created_at, updated_at, sent_at) "
+                        "VALUES (?, ?, 'sent', 1, ?, ?, ?)",
+                        (raw_post_id, canonical_url, now, now, now),
                     )
                     migrated_sent += max(cursor.rowcount, 0)
             connection.commit()

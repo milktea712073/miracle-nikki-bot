@@ -49,8 +49,16 @@ class KnowledgeRepository:
     def update_event(self, connection: sqlite3.Connection, event_id: int, official_series: str | None, event_type_id: int | None, description: str | None) -> None:
         connection.execute("UPDATE events SET official_series = ?, event_type_id = ?, description = ?, updated_at = ? WHERE id = ?", (official_series, event_type_id, description, utc_now_iso8601(), event_id))
 
-    def find_event(self, connection: sqlite3.Connection, name: str) -> int | None:
-        row = connection.execute("SELECT id FROM events WHERE name = ?", (name,)).fetchone()
+    def find_event_by_source_raw_post_id(
+        self, connection: sqlite3.Connection, source_raw_post_id: int | None
+    ) -> int | None:
+        """Find the event created from one raw post, never by display name."""
+        if source_raw_post_id is None:
+            return None
+        row = connection.execute(
+            "SELECT id FROM events WHERE source_raw_post_id = ? ORDER BY id LIMIT 1",
+            (source_raw_post_id,),
+        ).fetchone()
         return int(row[0]) if row else None
 
     def create_event(
@@ -60,12 +68,21 @@ class KnowledgeRepository:
         official_series: str | None,
         event_type_id: int | None,
         description: str | None,
+        source_raw_post_id: int | None = None,
     ) -> int:
         now = utc_now_iso8601()
         cursor = connection.execute(
-            "INSERT INTO events (name, official_series, event_type_id, description, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (name, official_series, event_type_id, description, now, now),
+            "INSERT INTO events (name, official_series, event_type_id, description, created_at, updated_at, source_raw_post_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                name,
+                official_series,
+                event_type_id,
+                description,
+                now,
+                now,
+                source_raw_post_id,
+            ),
         )
         return int(cursor.lastrowid)
 
@@ -84,7 +101,9 @@ class KnowledgeRepository:
         parser values only replace fields when a concrete value is available.
         """
         row = connection.execute(
-            "SELECT id, data_status FROM events WHERE name = ?", (name,)
+            "SELECT id, data_status FROM events WHERE source_raw_post_id = ? "
+            "ORDER BY id LIMIT 1",
+            (raw_post_id,),
         ).fetchone()
         now = utc_now_iso8601()
         if row is None:
@@ -106,11 +125,11 @@ class KnowledgeRepository:
                 SET official_series = COALESCE(?, official_series),
                     description = COALESCE(?, description),
                     content_type = ?,
-                    source_raw_post_id = ?, updated_at = ?, updated_via = 'parser',
+                    updated_at = ?, updated_via = 'parser',
                     data_status = 'auto'
                 WHERE id = ?
                 """,
-                (official_series, description, content_type, raw_post_id, now, event_id),
+                (official_series, description, content_type, now, event_id),
             )
         return event_id
 

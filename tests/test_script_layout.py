@@ -21,6 +21,7 @@ SCRIPT_MODULES = (
     "scripts.announcement.migrations.migrate_announcement_baseline",
     "scripts.announcement.requeue_announcement",
     "scripts.announcement.requeue_latest",
+    "scripts.announcement.repair_rebuild_queue",
     "scripts.diagnostic.facebook_feed_diagnostic",
     "scripts.diagnostic.facebook_feed_network_diagnostic",
     "scripts.diagnostic.debug_facebook_mobile",

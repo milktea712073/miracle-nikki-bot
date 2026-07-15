@@ -101,6 +101,22 @@ def test_requeue_latest_selects_real_sent_record_not_baseline_or_skipped(tmp_pat
     assert jobs.requeue_announcement_job(sent.url).job_id == 2
 
 
+def test_requeue_latest_ignores_history_raw_posts_inserted_after_sent_delivery(tmp_path):
+    """A rebuild may add old raw posts after the latest Discord delivery."""
+    database_path, jobs = seeded_repository(tmp_path)
+    older_sent = make_post("older-sent")
+    latest_sent = make_post("latest-sent")
+    RawPostRepository(database_path).save_raw_posts([older_sent, latest_sent])
+    jobs.mark_sent(1)
+    jobs.mark_sent(2)
+
+    # These rows intentionally have higher SQLite IDs but no sent ledger entry.
+    history_inserted_by_rebuild = [make_post("historical-a"), make_post("historical-b")]
+    RawPostRepository(database_path).save_raw_posts(history_inserted_by_rebuild)
+
+    assert jobs.find_latest_sent_announcement_url() == latest_sent.url
+
+
 def test_requeue_latest_without_sent_record_exits_nonzero(tmp_path, monkeypatch, capsys):
     _, jobs = seeded_repository(tmp_path)
     monkeypatch.setattr("scripts.announcement.requeue_latest.AnnouncementJobRepository", lambda: jobs)

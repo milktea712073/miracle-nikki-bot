@@ -185,6 +185,45 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
+    def get_queryable_event_by_id(self, event_id: int) -> EventView | None:
+        """Return one visible player-queryable event by its stable identifier."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT e.id, e.name, e.official_series, et.name, e.description, e.data_status
+                FROM events AS e
+                LEFT JOIN event_types AS et ON et.id = e.event_type_id
+                WHERE e.id = ?
+                  AND e.content_type IN ('event', 'suit_event')
+                  AND e.is_visible = 1
+                """,
+                (event_id,),
+            ).fetchone()
+            return self._build_event_view(connection, row) if row is not None else None
+        finally:
+            connection.close()
+
+    def get_events_by_name(self, name: str) -> list[EventView]:
+        """Return every visible event with an exact display name."""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT e.id, e.name, e.official_series, et.name, e.description, e.data_status
+                FROM events AS e
+                LEFT JOIN event_types AS et ON et.id = e.event_type_id
+                WHERE e.name = ?
+                  AND e.content_type IN ('event', 'suit_event')
+                  AND e.is_visible = 1
+                ORDER BY e.id
+                """,
+                (name.strip(),),
+            ).fetchall()
+            return [self._build_event_view(connection, row) for row in rows]
+        finally:
+            connection.close()
+
     def get_event_edit_context(self, event_id: int) -> EventEditContext | None:
         """Read one event and its most recent period for the management UI."""
         connection = self._connect()
@@ -744,6 +783,38 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
+    def search_event_options(
+        self, query: str, limit: int = 5
+    ) -> list[tuple[int, str, str | None]]:
+        """Return distinct autocomplete options keyed by the event primary key."""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT e.id, e.name,
+                       (
+                           SELECT start_at
+                           FROM event_periods
+                           WHERE event_id = e.id
+                           ORDER BY start_at IS NULL, start_at DESC, id DESC
+                           LIMIT 1
+                       ) AS latest_start_at
+                FROM events AS e
+                WHERE e.name LIKE ?
+                  AND e.content_type IN ('event', 'suit_event')
+                  AND e.is_visible = 1
+                ORDER BY e.name, latest_start_at DESC, e.id DESC
+                LIMIT ?
+                """,
+                (f"%{query.strip()}%", limit),
+            ).fetchall()
+            return [
+                (int(event_id), str(name), str(start_at) if start_at else None)
+                for event_id, name, start_at in rows
+            ]
+        finally:
+            connection.close()
+
     def search_suit_names(self, query: str, limit: int = 5) -> list[str]:
         """Return a small list of matching suit names for command suggestions."""
         return self._search_names("suits", query, limit)
@@ -770,6 +841,26 @@ class KnowledgeQueryRepository:
                 ).fetchone()
             except sqlite3.OperationalError:
                 return None
+            return str(row[0]) if row else None
+        finally:
+            connection.close()
+
+    def get_announcement_image_for_event_id(self, event_id: int) -> str | None:
+        """Return the first image from the raw post that created this event."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT raw_post_images.image_url
+                FROM events
+                JOIN raw_post_images
+                    ON raw_post_images.raw_post_id = events.source_raw_post_id
+                WHERE events.id = ?
+                ORDER BY raw_post_images.position ASC, raw_post_images.id ASC
+                LIMIT 1
+                """,
+                (event_id,),
+            ).fetchone()
             return str(row[0]) if row else None
         finally:
             connection.close()

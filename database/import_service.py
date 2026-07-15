@@ -41,7 +41,8 @@ def import_parse_draft(draft_id: int, database_path: Path | None = None) -> Impo
             raise DraftImportError(f"Parse draft {draft_id} has no event name candidate.")
 
         connection.execute("BEGIN")
-        event_id = repository.find_event(connection, str(event_name))
+        raw_post_id = int(draft["raw_post_id"])
+        event_id = repository.find_event_by_source_raw_post_id(connection, raw_post_id)
         if event_id is None:
             event_id = repository.create_event(
                 connection,
@@ -49,6 +50,7 @@ def import_parse_draft(draft_id: int, database_path: Path | None = None) -> Impo
                 review["official_series"],
                 review["event_type_id"],
                 draft["title"],
+                raw_post_id,
             )
         else:
             repository.update_event(connection, event_id, review["official_series"], review["event_type_id"], draft["title"])

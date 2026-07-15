@@ -328,11 +328,19 @@ async def event_name_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     try:
-        names = await asyncio.to_thread(KnowledgeQueryRepository().search_event_names, current)
+        options = await asyncio.to_thread(
+            KnowledgeQueryRepository().search_event_options, current
+        )
     except Exception:
         LOGGER.exception("讀取活動名稱提示失敗。")
         return []
-    return [app_commands.Choice(name=name, value=name) for name in names]
+    return [
+        app_commands.Choice(
+            name=truncate(f"{name}（{format_date(start_at) or '日期未提供'}）", 100),
+            value=str(event_id),
+        )
+        for event_id, name, start_at in options
+    ]
 
 
 async def suit_name_autocomplete(
@@ -356,8 +364,27 @@ async def event_command(interaction: discord.Interaction, name: str) -> None:
     await interaction.response.defer(thinking=True)
     repository = KnowledgeQueryRepository()
     try:
-        event = await asyncio.to_thread(repository.get_event_by_name, name)
-        image_url = await asyncio.to_thread(repository.get_announcement_image_for_event, name)
+        event_id = int(name) if name.isdecimal() else None
+        if event_id is not None:
+            event = await asyncio.to_thread(
+                repository.get_queryable_event_by_id, event_id
+            )
+        else:
+            matches = await asyncio.to_thread(repository.get_events_by_name, name)
+            if len(matches) > 1:
+                await interaction.followup.send(
+                    "找到多筆同名活動，請從自動完成選擇指定檔期。",
+                    ephemeral=True,
+                )
+                return
+            event = matches[0] if matches else None
+        image_url = (
+            await asyncio.to_thread(
+                repository.get_announcement_image_for_event_id, event.id
+            )
+            if event is not None
+            else None
+        )
     except Exception:
         LOGGER.exception("查詢活動失敗：%s", name)
         await interaction.followup.send("查詢活動時發生錯誤，請稍後再試。", ephemeral=True)

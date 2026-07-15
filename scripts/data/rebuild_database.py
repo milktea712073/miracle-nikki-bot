@@ -59,7 +59,10 @@ def rebuild_database(
         if resetter is not None
         else reset_rebuildable_data(database_path)
     )
-    fetch = fetcher(limit, database_path)
+    if fetcher is fetch_and_save_raw_posts:
+        fetch = fetcher(limit, database_path, enqueue_announcements=False)
+    else:
+        fetch = fetcher(limit, database_path)
     if fetch.fetched_count < limit:
         LOGGER.warning(
             "Facebook exposed %s post(s), fewer than requested limit %s.",

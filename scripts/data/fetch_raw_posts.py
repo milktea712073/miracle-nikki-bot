@@ -33,11 +33,14 @@ def fetch_and_save_raw_posts(
     database_path: Path | None = None,
     *,
     crawler: Callable[[int], list[Post]] = get_latest_posts,
+    enqueue_announcements: bool = True,
 ) -> FetchRawPostsResult:
     """Fetch recent posts and persist them without involving Discord."""
     init_database(database_path)
     posts = crawler(limit)
-    storage = RawPostRepository(database_path).save_raw_posts(posts)
+    storage = RawPostRepository(database_path).save_raw_posts(
+        posts, enqueue_announcements=enqueue_announcements
+    )
     if any("locked" in failure.error.lower() for failure in storage.failures):
         raise sqlite3.OperationalError("database is locked")
     return FetchRawPostsResult(len(posts), storage)
