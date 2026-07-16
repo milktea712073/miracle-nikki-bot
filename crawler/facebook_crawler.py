@@ -1012,6 +1012,7 @@ def parse_post(page: Page, post_url: str, debug: bool = False) -> Post:
         content=get_full_post_content(article),
         published_at=published_at,
         images=get_image_urls(article),
+        metadata={"official_post_verified": True},
     )
 
 

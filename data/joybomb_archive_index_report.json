@@ -1,0 +1,42 @@
+{
+  "cdx_index_total": 1514,
+  "original_url_total": 1174,
+  "detail_snapshot_count": 1323,
+  "unique_detail_url_count": 575,
+  "collapsed_duplicate_count": 748,
+  "earliest_timestamp": "20170528094521",
+  "latest_timestamp": "20240423005032",
+  "capture_year_distribution": {
+    "2017": 152,
+    "2018": 162,
+    "2019": 184,
+    "2020": 228,
+    "2021": 377,
+    "2022": 186,
+    "2023": 32,
+    "2024": 2
+  },
+  "unique_notice_capture_year_distribution": {
+    "2017": 92,
+    "2018": 81,
+    "2019": 79,
+    "2020": 91,
+    "2021": 137,
+    "2022": 72,
+    "2023": 21,
+    "2024": 2
+  },
+  "url_variations": {
+    "http": 314,
+    "https": 1009,
+    "port_80": 314,
+    "query": 1301
+  },
+  "unparseable_detail_urls": [],
+  "sampled_published_year_distribution": {},
+  "unverified_query_patterns": {
+    "nu3.joybomb.com.tw/notice/noticecontent*": "JoyBombArchiveError",
+    "nu3.joybomb.com.tw/mobile/noticecontent/*": "JoyBombArchiveError"
+  },
+  "unverified_capture_years": []
+}

@@ -75,9 +75,23 @@ def initialize_raw_tables(connection: sqlite3.Connection) -> None:
             UNIQUE(raw_post_id, image_url)
         );
 
+        CREATE TABLE IF NOT EXISTS raw_post_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_post_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            source_post_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE CASCADE,
+            UNIQUE(source, source_post_id),
+            UNIQUE(source, url)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_raw_posts_url ON raw_posts(url);
         CREATE INDEX IF NOT EXISTS idx_raw_posts_published_at ON raw_posts(published_at);
         CREATE INDEX IF NOT EXISTS idx_raw_posts_parse_status ON raw_posts(parse_status);
+        CREATE INDEX IF NOT EXISTS idx_raw_post_aliases_raw_post_id
+            ON raw_post_aliases(raw_post_id);
         """
     )
     raw_columns = {

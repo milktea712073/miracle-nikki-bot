@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from crawler.models import Post
 from database.announcement_identity import canonical_announcement_url
@@ -91,6 +91,15 @@ def image_hash_value(image_url: str) -> str:
     return image_url
 
 
+def stable_image_filenames(images: list[str]) -> frozenset[str]:
+    """Return stable media file names for conservative Facebook alias matching."""
+    return frozenset(
+        filename.lower()
+        for image_url in images
+        if (filename := unquote(urlsplit(image_url).path.rsplit("/", 1)[-1]))
+    )
+
+
 def compute_content_hash(post: Post) -> str:
     """Hash the raw fields that should trigger a parser re-run when changed."""
     payload = {
@@ -129,22 +138,120 @@ class RawPostRepository:
                 (source, source_post_id),
             ).fetchone()
             if row is None:
+                row = connection.execute(
+                    "SELECT r.* FROM raw_post_aliases a "
+                    "JOIN raw_posts r ON r.id = a.raw_post_id "
+                    "WHERE a.source = ? AND a.source_post_id = ?",
+                    (source, source_post_id),
+                ).fetchone()
+            if row is None:
                 return None
-            images = connection.execute(
-                "SELECT image_url FROM raw_post_images WHERE raw_post_id = ? "
-                "ORDER BY position ASC",
-                (row[0],),
-            ).fetchall()
-            columns = [column[0] for column in connection.execute(
-                "SELECT * FROM raw_posts LIMIT 0"
-            ).description]
-            result = dict(zip(columns, row, strict=True))
-            result["images"] = [image[0] for image in images]
-            metadata_json = result.get("metadata_json")
-            result["metadata"] = json.loads(metadata_json) if metadata_json else None
-            return result
+            return self._raw_row_to_dict(connection, row)
         finally:
             connection.close()
+
+    @staticmethod
+    def _raw_row_to_dict(connection: sqlite3.Connection, row: tuple[object, ...]) -> dict[str, object]:
+        images = connection.execute(
+            "SELECT image_url FROM raw_post_images WHERE raw_post_id = ? ORDER BY position ASC",
+            (row[0],),
+        ).fetchall()
+        columns = [column[0] for column in connection.execute(
+            "SELECT * FROM raw_posts LIMIT 0"
+        ).description]
+        result = dict(zip(columns, row, strict=True))
+        result["images"] = [image[0] for image in images]
+        metadata_json = result.get("metadata_json")
+        result["metadata"] = json.loads(metadata_json) if metadata_json else None
+        return result
+
+    @staticmethod
+    def _is_verified_facebook_post(post: Post) -> bool:
+        return post.source.strip().lower() == SOURCE_FACEBOOK and bool(
+            (post.metadata or {}).get("official_post_verified")
+        )
+
+    @staticmethod
+    def _metadata_is_verified(metadata_json: object) -> bool:
+        if not isinstance(metadata_json, str) or not metadata_json:
+            return False
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(metadata, dict) and bool(metadata.get("official_post_verified"))
+
+    def _images_for_raw_post(self, connection: sqlite3.Connection, raw_post_id: int) -> list[str]:
+        return [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT image_url FROM raw_post_images WHERE raw_post_id = ? ORDER BY position ASC",
+                (raw_post_id,),
+            ).fetchall()
+        ]
+
+    def _is_conservative_facebook_duplicate(
+        self,
+        connection: sqlite3.Connection,
+        existing: tuple[object, ...],
+        post: Post,
+        published_at: str | None,
+        images: list[str],
+    ) -> bool:
+        """Require all independent trusted signals before automatic pfbid merging."""
+        if not self._is_verified_facebook_post(post):
+            return False
+        existing_id = int(existing[0])
+        existing_content = str(existing[4])
+        existing_published_at = existing[5]
+        existing_metadata = existing[6]
+        return (
+            self._metadata_is_verified(existing_metadata)
+            and existing_content == post.content
+            and stable_image_filenames(self._images_for_raw_post(connection, existing_id))
+            == stable_image_filenames(images)
+            and existing_published_at == published_at
+        )
+
+    @staticmethod
+    def _record_alias(
+        connection: sqlite3.Connection,
+        raw_post_id: int,
+        source: str,
+        source_post_id: str,
+        post_url: str,
+        now: str,
+    ) -> None:
+        connection.execute(
+            "INSERT OR IGNORE INTO raw_post_aliases "
+            "(raw_post_id, source, source_post_id, url, created_at) VALUES (?, ?, ?, ?, ?)",
+            (raw_post_id, source, source_post_id, post_url, now),
+        )
+
+    def _find_conservative_facebook_duplicate(
+        self,
+        connection: sqlite3.Connection,
+        post: Post,
+        published_at: str | None,
+        images: list[str],
+    ) -> tuple[object, ...] | None:
+        """Find a trusted legacy row with every alias signal intact."""
+        if not self._is_verified_facebook_post(post):
+            return None
+        rows = connection.execute(
+            "SELECT id, source, source_post_id, url, content, published_at, metadata_json "
+            "FROM raw_posts WHERE source = ? AND content = ?",
+            (SOURCE_FACEBOOK, post.content),
+        ).fetchall()
+        for row in rows:
+            if self._is_conservative_facebook_duplicate(connection, row, post, published_at, images):
+                return row
+        if rows:
+            LOGGER.info(
+                "Possible Facebook duplicate was not merged post_id=%s reason=insufficient_identity_evidence",
+                post.post_id,
+            )
+        return None
 
     def _insert_images(
         self, connection: sqlite3.Connection, raw_post_id: int, images: list[str], now: str
@@ -174,17 +281,51 @@ class RawPostRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            existing = connection.execute(
-                "SELECT id, content_hash FROM raw_posts "
+            direct_existing = connection.execute(
+                "SELECT id, source, source_post_id, url, content, published_at, metadata_json, content_hash FROM raw_posts "
                 "WHERE source = ? AND source_post_id = ?",
                 (source, post.post_id),
             ).fetchone()
+            alias_existing = None
+            if direct_existing is None:
+                alias_existing = connection.execute(
+                    "SELECT r.id, r.source, r.source_post_id, r.url, r.content, r.published_at, "
+                    "r.metadata_json, r.content_hash FROM raw_post_aliases a "
+                    "JOIN raw_posts r ON r.id = a.raw_post_id "
+                    "WHERE a.source = ? AND a.source_post_id = ?",
+                    (source, post.post_id),
+                ).fetchone()
+            existing = direct_existing or alias_existing
 
-            if existing is not None and existing[1] == content_hash:
+            if direct_existing is not None and direct_existing[7] == content_hash:
                 connection.commit()
                 return RawPostSaveResult(post.post_id, "unchanged", int(existing[0]))
 
+            if alias_existing is not None and self._is_conservative_facebook_duplicate(
+                connection, alias_existing[:7], post, published_at, images
+            ):
+                connection.execute(
+                    "UPDATE raw_posts SET updated_at = ?, metadata_json = ? WHERE id = ?",
+                    (now, metadata_json, int(alias_existing[0])),
+                )
+                connection.commit()
+                return RawPostSaveResult(post.post_id, "unchanged", int(alias_existing[0]))
+
             if existing is None:
+                duplicate = self._find_conservative_facebook_duplicate(
+                    connection, post, published_at, images
+                )
+                if duplicate is not None:
+                    raw_post_id = int(duplicate[0])
+                    self._record_alias(
+                        connection, raw_post_id, source, post.post_id, post_url, now
+                    )
+                    connection.execute(
+                        "UPDATE raw_posts SET updated_at = ?, metadata_json = ? WHERE id = ?",
+                        (now, metadata_json, raw_post_id),
+                    )
+                    connection.commit()
+                    return RawPostSaveResult(post.post_id, "unchanged", raw_post_id)
                 cursor = connection.execute(
                     "INSERT INTO raw_posts (source, source_post_id, url, content, published_at, "
                     "scraped_at, updated_at, parse_status, parse_error, content_hash, metadata_json) "
@@ -213,11 +354,31 @@ class RawPostRepository:
                     )
             else:
                 raw_post_id = int(existing[0])
+                # An alias already proves this pfbid maps to the same source post.
+                # Preserve the first canonical raw URL rather than oscillating between aliases.
+                stored_url = str(existing[3]) if alias_existing is not None else post_url
+                update_post = post if alias_existing is None else Post(
+                    post_id=post.post_id,
+                    url=stored_url,
+                    content=post.content,
+                    published_at=post.published_at,
+                    images=post.images,
+                    source=post.source,
+                    metadata=post.metadata,
+                )
                 connection.execute(
                     "UPDATE raw_posts SET url = ?, content = ?, published_at = ?, "
                     "updated_at = ?, parse_status = 'pending', parse_error = NULL, "
                     "content_hash = ?, metadata_json = ? WHERE id = ?",
-                    (post_url, post.content, published_at, now, content_hash, metadata_json, raw_post_id),
+                    (
+                        stored_url,
+                        post.content,
+                        published_at,
+                        now,
+                        compute_content_hash(update_post),
+                        metadata_json,
+                        raw_post_id,
+                    ),
                 )
                 connection.execute(
                     "DELETE FROM raw_post_images WHERE raw_post_id = ?", (raw_post_id,)

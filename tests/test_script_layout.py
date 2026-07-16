@@ -17,6 +17,7 @@ SCRIPT_MODULES = (
     "scripts.data.reset_database",
     "scripts.data.rebuild_database",
     "scripts.data.cleanup_auto_suits",
+    "scripts.data.repair_facebook_post_aliases",
     "scripts.announcement.initialize_announcement_queue",
     "scripts.announcement.baseline_announcements",
     "scripts.announcement.migrations.migrate_announcement_baseline",
