@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Collection
 
 from database.knowledge_repository import KnowledgeRepository
 
@@ -23,9 +24,17 @@ class AutoImportResult:
 
 
 def auto_import_parse_draft(
-    draft_id: int, database_path: Path | None = None
+    draft_id: int,
+    database_path: Path | None = None,
+    *,
+    eligible_suit_names: Collection[str] | None = None,
 ) -> AutoImportResult:
-    """Upsert parser candidates without overwriting verified knowledge records."""
+    """Upsert parser candidates without overwriting verified knowledge records.
+
+    ``eligible_suit_names`` lets a maintenance workflow import only a reviewed
+    subset of an unchanged draft.  Normal parser execution continues to import
+    every stored candidate by leaving it as ``None``.
+    """
     repository = KnowledgeRepository(database_path)
     connection = repository.connect()
     try:
@@ -35,6 +44,9 @@ def auto_import_parse_draft(
 
         content_type = str(draft.get("content_type_candidate") or "other")
         suit_names = [str(name).strip() for name in draft["suits"] if str(name).strip()]
+        if eligible_suit_names is not None:
+            allowed = {str(name).strip() for name in eligible_suit_names if str(name).strip()}
+            suit_names = [name for name in suit_names if name in allowed]
         # Compatibility for legacy drafts created before content classification.
         if content_type == "other" and suit_names:
             content_type = "suit_event"
@@ -72,6 +84,18 @@ def auto_import_parse_draft(
             return AutoImportResult(draft_id, "needs_review", None, [])
 
         raw_post_id = int(draft["raw_post_id"])
+        source_row = connection.execute(
+            "SELECT source FROM raw_posts WHERE id = ?", (raw_post_id,)
+        ).fetchone()
+        source = str(source_row[0]) if source_row is not None else ""
+        # JoyBomb notices can contain several independent, explicitly split
+        # activities.  Their event identity therefore includes the section
+        # fingerprint.  Existing Facebook and website imports retain their
+        # established one-event-per-raw-post identity.
+        section_hash = str(draft["section_hash"]) if source == "joybomb_archive" else None
+        splitter_version = (
+            str(draft["splitter_version"]) if source == "joybomb_archive" else None
+        )
         connection.execute("BEGIN")
         event_id: int | None = None
         if event_name is not None:
@@ -82,6 +106,8 @@ def auto_import_parse_draft(
                 draft["title"],
                 raw_post_id,
                 content_type,
+                section_hash,
+                splitter_version,
             )
             period_type = str(draft["period_type_candidate"] or "unknown")
             start_at = draft["start_at_candidate"]

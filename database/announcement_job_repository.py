@@ -6,12 +6,14 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from database.announcement_identity import canonical_announcement_url
 from database.database import ensure_database_initialized, get_connection
 
 
 BASELINE_CONTENT_PREFIX = "[baseline skipped; not sent to Discord] "
+ALREADY_DELIVERED_ALIAS_ERROR = "Skipped duplicate Facebook alias of an already delivered post"
 
 
 def utc_now() -> str:
@@ -86,6 +88,13 @@ class AnnouncementJobRepository:
             return
         if not AnnouncementJobRepository.is_initialized_in_connection(connection) or not enqueue:
             return
+        if AnnouncementJobRepository._has_equivalent_terminal_delivery(
+            connection, raw_post_id
+        ):
+            # This is a second safety net for historical duplicate rows.  The
+            # raw repository normally aliases the post before this point, but a
+            # previously persisted duplicate must never create another job.
+            return
         sent = AnnouncementJobRepository._announcement_exists_in_connection(
             connection, canonical_url
         )
@@ -111,6 +120,85 @@ class AnnouncementJobRepository:
         return any(
             canonical_announcement_url(str(row[0])) == canonical_url
             for row in connection.execute("SELECT post_url FROM announcements")
+        )
+
+    @staticmethod
+    def _stable_image_filenames(connection: sqlite3.Connection, raw_post_id: int) -> frozenset[str]:
+        """Return Facebook CDN filenames without volatile query parameters."""
+        return frozenset(
+            filename.lower()
+            for (image_url,) in connection.execute(
+                "SELECT image_url FROM raw_post_images WHERE raw_post_id = ? ORDER BY position ASC",
+                (raw_post_id,),
+            ).fetchall()
+            if (filename := unquote(urlsplit(str(image_url)).path.rsplit("/", 1)[-1]))
+        )
+
+    @classmethod
+    def _raw_posts_have_same_delivery_identity(
+        cls,
+        connection: sqlite3.Connection,
+        first_raw_post_id: int,
+        second_raw_post_id: int,
+    ) -> bool:
+        """Compare the conservative identity used to prevent pfbid resend jobs."""
+        rows = connection.execute(
+            "SELECT id, source, content, published_at FROM raw_posts WHERE id IN (?, ?)",
+            (first_raw_post_id, second_raw_post_id),
+        ).fetchall()
+        if len(rows) != 2:
+            return False
+        by_id = {int(row[0]): row for row in rows}
+        first = by_id[first_raw_post_id]
+        second = by_id[second_raw_post_id]
+        if str(first[1]) != "facebook" or str(second[1]) != "facebook":
+            return False
+        if str(first[2]) != str(second[2]) or first[3] != second[3]:
+            return False
+        first_images = cls._stable_image_filenames(connection, first_raw_post_id)
+        second_images = cls._stable_image_filenames(connection, second_raw_post_id)
+        # Empty media plus an absent Facebook publication time is not enough
+        # independent evidence to suppress a potentially distinct text post.
+        if not first_images and first[3] is None:
+            return False
+        return first_images == second_images
+
+    @classmethod
+    def _has_equivalent_terminal_delivery(
+        cls,
+        connection: sqlite3.Connection,
+        raw_post_id: int,
+        *,
+        exclude_job_id: int | None = None,
+    ) -> bool:
+        """Return whether an equivalent Facebook raw post already reached a terminal state."""
+        terminal_rows = connection.execute(
+            "SELECT id, raw_post_id FROM announcement_jobs "
+            "WHERE raw_post_id IS NOT NULL AND status IN ('sent', 'skipped')"
+        ).fetchall()
+        for job_id, terminal_raw_post_id in terminal_rows:
+            if exclude_job_id is not None and int(job_id) == exclude_job_id:
+                continue
+            if int(terminal_raw_post_id) != raw_post_id and cls._raw_posts_have_same_delivery_identity(
+                connection, raw_post_id, int(terminal_raw_post_id)
+            ):
+                return True
+
+        # Cover legacy ledgers that have no matching queue row.
+        announced_urls = {
+            canonical_announcement_url(str(row[0]))
+            for row in connection.execute("SELECT post_url FROM announcements").fetchall()
+        }
+        if not announced_urls:
+            return False
+        raw_rows = connection.execute(
+            "SELECT id, url FROM raw_posts WHERE source = 'facebook' AND id != ?",
+            (raw_post_id,),
+        ).fetchall()
+        return any(
+            canonical_announcement_url(str(url)) in announced_urls
+            and cls._raw_posts_have_same_delivery_identity(connection, raw_post_id, int(other_raw_post_id))
+            for other_raw_post_id, url in raw_rows
         )
 
     def is_initialized(self) -> bool:
@@ -227,18 +315,29 @@ class AnnouncementJobRepository:
         try:
             connection.execute("BEGIN")
             rows = connection.execute(
-                "SELECT id FROM announcement_jobs WHERE raw_post_id IS NOT NULL "
+                "SELECT id, raw_post_id FROM announcement_jobs WHERE raw_post_id IS NOT NULL "
                 "AND status IN ('pending', 'failed') "
                 "ORDER BY created_at ASC, id ASC LIMIT ?",
                 (limit,),
             ).fetchall()
-            job_ids = [int(row[0]) for row in rows]
-            for job_id in job_ids:
+            job_ids: list[int] = []
+            for job_id_value, raw_post_id_value in rows:
+                job_id = int(job_id_value)
+                if self._has_equivalent_terminal_delivery(
+                    connection, int(raw_post_id_value), exclude_job_id=job_id
+                ):
+                    connection.execute(
+                        "UPDATE announcement_jobs SET status = 'skipped', last_error = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (ALREADY_DELIVERED_ALIAS_ERROR, now, job_id),
+                    )
+                    continue
                 connection.execute(
                     "UPDATE announcement_jobs SET status = 'sending', attempt_count = attempt_count + 1, "
                     "last_error = NULL, updated_at = ? WHERE id = ?",
                     (now, job_id),
                 )
+                job_ids.append(job_id)
             connection.commit()
         except Exception:
             connection.rollback()

@@ -223,6 +223,13 @@ def initialize_parse_draft_tables(connection: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             raw_post_id INTEGER NOT NULL,
             parser_version TEXT NOT NULL,
+            section_index INTEGER NOT NULL DEFAULT 1,
+            section_heading TEXT,
+            normalized_heading TEXT,
+            section_start_line INTEGER NOT NULL DEFAULT 1,
+            section_end_line INTEGER NOT NULL DEFAULT 1,
+            section_hash TEXT NOT NULL DEFAULT '',
+            splitter_version TEXT NOT NULL DEFAULT 'whole-post-v0',
             status TEXT NOT NULL DEFAULT 'pending',
             title TEXT,
             event_name_candidate TEXT,
@@ -239,7 +246,7 @@ def initialize_parse_draft_tables(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE CASCADE,
-            UNIQUE(raw_post_id, parser_version)
+            UNIQUE(raw_post_id, section_hash, splitter_version, parser_version)
         );
 
         CREATE TABLE IF NOT EXISTS parse_draft_suits (
@@ -261,7 +268,111 @@ def initialize_parse_draft_tables(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE parse_drafts ADD COLUMN content_type_candidate TEXT NOT NULL DEFAULT 'other'"
         )
+    _migrate_parse_drafts_to_section_identity(connection)
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_parse_drafts_section_identity
+            ON parse_drafts(raw_post_id, section_hash, splitter_version, parser_version);
+        CREATE INDEX IF NOT EXISTS idx_parse_drafts_section_hash ON parse_drafts(section_hash);
+        """
+    )
     connection.commit()
+
+
+def _parse_drafts_has_legacy_identity(connection: sqlite3.Connection) -> bool:
+    """Return whether the pre-section unique key is still present."""
+    for index in connection.execute("PRAGMA index_list(parse_drafts)").fetchall():
+        if not index[2]:
+            continue
+        columns = [row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})").fetchall()]
+        if columns == ["raw_post_id", "parser_version"]:
+            return True
+    return False
+
+
+def _migrate_parse_drafts_to_section_identity(connection: sqlite3.Connection) -> None:
+    """Preserve legacy draft rows while replacing the old whole-post unique key."""
+    if not _parse_drafts_has_legacy_identity(connection):
+        return
+
+    from content.section_splitter import calculate_section_hash
+
+    rows = connection.execute("SELECT * FROM parse_drafts ORDER BY id").fetchall()
+    columns = [item[0] for item in connection.execute("SELECT * FROM parse_drafts LIMIT 0").description]
+    legacy_rows = [dict(zip(columns, row, strict=True)) for row in rows]
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.executescript(
+            """
+            CREATE TABLE parse_drafts_sectioned (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_post_id INTEGER NOT NULL,
+                parser_version TEXT NOT NULL,
+                section_index INTEGER NOT NULL DEFAULT 1,
+                section_heading TEXT,
+                normalized_heading TEXT,
+                section_start_line INTEGER NOT NULL DEFAULT 1,
+                section_end_line INTEGER NOT NULL DEFAULT 1,
+                section_hash TEXT NOT NULL DEFAULT '',
+                splitter_version TEXT NOT NULL DEFAULT 'whole-post-v0',
+                status TEXT NOT NULL DEFAULT 'pending',
+                title TEXT,
+                content_type_candidate TEXT NOT NULL DEFAULT 'other',
+                event_name_candidate TEXT,
+                official_series_candidate TEXT,
+                period_type_candidate TEXT,
+                start_at_candidate TEXT,
+                end_at_candidate TEXT,
+                player_category_candidate TEXT,
+                acquisition_method_candidate TEXT,
+                confidence REAL,
+                parser_notes TEXT,
+                review_notes TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (raw_post_id) REFERENCES raw_posts(id) ON DELETE CASCADE,
+                UNIQUE(raw_post_id, section_hash, splitter_version, parser_version)
+            );
+            """
+        )
+        for row in legacy_rows:
+            content_row = connection.execute("SELECT content FROM raw_posts WHERE id = ?", (row["raw_post_id"],)).fetchone()
+            content = str(content_row[0]) if content_row else ""
+            section_hash = calculate_section_hash(None, content)
+            line_count = max(1, len(content.replace("\r\n", "\n").replace("\r", "\n").split("\n")))
+            connection.execute(
+                """
+                INSERT INTO parse_drafts_sectioned (
+                    id, raw_post_id, parser_version, section_index, section_heading, normalized_heading,
+                    section_start_line, section_end_line, section_hash, splitter_version, status, title,
+                    content_type_candidate, event_name_candidate, official_series_candidate,
+                    period_type_candidate, start_at_candidate, end_at_candidate, player_category_candidate,
+                    acquisition_method_candidate, confidence, parser_notes, review_notes, error_message,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 1, NULL, NULL, 1, ?, ?, 'whole-post-v0', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"], row["raw_post_id"], row["parser_version"], line_count, section_hash,
+                    row["status"], row["title"], row.get("content_type_candidate", "other"),
+                    row["event_name_candidate"], row["official_series_candidate"], row["period_type_candidate"],
+                    row["start_at_candidate"], row["end_at_candidate"], row["player_category_candidate"],
+                    row["acquisition_method_candidate"], row["confidence"], row["parser_notes"],
+                    row["review_notes"], row["error_message"], row["created_at"], row["updated_at"],
+                ),
+            )
+        connection.execute("DROP TABLE parse_drafts")
+        connection.execute("ALTER TABLE parse_drafts_sectioned RENAME TO parse_drafts")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
@@ -290,6 +401,8 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
             description TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            source_section_hash TEXT,
+            source_splitter_version TEXT,
             FOREIGN KEY (event_type_id) REFERENCES event_types(id)
         );
 
@@ -365,6 +478,16 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_source_raw_post_id "
         "ON events(source_raw_post_id)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_section_source "
+        "ON events(source_raw_post_id, source_section_hash, source_splitter_version)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_section_source "
+        "ON events(source_raw_post_id, source_section_hash, source_splitter_version) "
+        "WHERE source_raw_post_id IS NOT NULL AND source_section_hash IS NOT NULL "
+        "AND source_splitter_version IS NOT NULL"
+    )
     connection.commit()
 
 
@@ -390,6 +513,8 @@ def _initialize_knowledge_provenance_columns(connection: sqlite3.Connection) -> 
             ("is_visible", "INTEGER NOT NULL DEFAULT 1"),
             ("data_status", "TEXT NOT NULL DEFAULT 'auto'"),
             ("source_raw_post_id", "INTEGER"),
+            ("source_section_hash", "TEXT"),
+            ("source_splitter_version", "TEXT"),
             ("created_via", "TEXT NOT NULL DEFAULT 'auto'"),
             ("updated_via", "TEXT NOT NULL DEFAULT 'auto'"),
         ),
@@ -450,6 +575,8 @@ def _migrate_events_name_unique_constraint(connection: sqlite3.Connection) -> No
                 is_visible INTEGER NOT NULL DEFAULT 1,
                 data_status TEXT NOT NULL DEFAULT 'auto',
                 source_raw_post_id INTEGER,
+                source_section_hash TEXT,
+                source_splitter_version TEXT,
                 created_via TEXT NOT NULL DEFAULT 'auto',
                 updated_via TEXT NOT NULL DEFAULT 'auto',
                 FOREIGN KEY (event_type_id) REFERENCES event_types(id)
@@ -458,12 +585,14 @@ def _migrate_events_name_unique_constraint(connection: sqlite3.Connection) -> No
             INSERT INTO events_rebuilt (
                 id, name, official_series, event_type_id, description, created_at,
                 updated_at, content_type, event_status, is_visible, data_status,
-                source_raw_post_id, created_via, updated_via
+                source_raw_post_id, source_section_hash, source_splitter_version,
+                created_via, updated_via
             )
             SELECT
                 id, name, official_series, event_type_id, description, created_at,
                 updated_at, content_type, event_status, is_visible, data_status,
-                source_raw_post_id, created_via, updated_via
+                source_raw_post_id, source_section_hash, source_splitter_version,
+                created_via, updated_via
             FROM events;
 
             DROP TABLE events;

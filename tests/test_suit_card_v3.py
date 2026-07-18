@@ -89,6 +89,10 @@ def seed_suit(
                 "INSERT INTO raw_post_images (raw_post_id, image_url, position, created_at) VALUES (?, ?, 0, '2026-01-01T00:00:00+00:00')",
                 (raw_post_id, image_url),
             )
+            connection.execute(
+                "UPDATE events SET source_raw_post_id = ? WHERE id = ?",
+                (raw_post_id, event_id),
+            )
         connection.commit()
     finally:
         connection.close()

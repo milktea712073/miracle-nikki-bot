@@ -1,4 +1,4 @@
-from parser.announcement_parser import classify_content, is_valid_suit_name, parse_announcement
+from parser.announcement_parser import classify_content, is_valid_suit_name, parse_announcement, parse_suits
 
 
 def test_rerun_title_period_and_suits():
@@ -180,3 +180,43 @@ def test_source_neutral_content_type_hint_has_priority_over_text_classification(
     )
 
     assert draft.content_type_candidate == "system"
+
+
+def test_generic_source_title_is_not_used_as_an_event_name():
+    draft = parse_announcement(
+        "\u65b0\u805e\u516c\u544a\n"
+        "\u590f\u65e5\u661f\u5922\n"
+        "\u6d3b\u52d5\u6642\u9593\uff1a2026/07/13 05:00 - 2026/07/19 23:59"
+    )
+
+    assert draft.event_name_candidate == "\u590f\u65e5\u661f\u5922"
+    assert parse_announcement("\u5b98\u65b9\u516c\u544a\n\u89aa\u611b\u7684\u73a9\u5bb6").event_name_candidate is None
+
+
+def test_maintenance_time_description_does_not_override_an_activity_section():
+    assert classify_content(
+        "\u6d3b\u52d5\u516c\u544a",
+        "\u7dad\u8b77\u5f8c\u958b\u555f\uff0c\u6d3b\u52d5\u6642\u9593\uff1a2026/07/13 05:00 - 2026/07/19 23:59",
+        False,
+    ) == "event"
+    assert classify_content("\u7dad\u8b77\u516c\u544a", "\u7dad\u8b77\u6642\u9593\uff1a05:00 - 09:00", False) == "system"
+
+
+def test_suit_parser_supports_legacy_brackets_and_prose_without_accepting_new_label():
+    suits = parse_suits(
+        "\u53ef\u7372\u5f97\u300c\u6696\u5fc3\u871c\u610f\u300d\u5957\u88dd\n"
+        "\u53ef\u7372\u5f97\uff3b\u6d77\u6c99\u66a2\u60f3\uff3d\u5957\u88dd\n"
+        "\u53ef\u7372\u5f97 \u661f\u591c\u82b1\u5712 \u5957\u88dd\n"
+        "\u96c6\u9f4a \u9727\u4e2d\u82b1\u5712 \u5957\u88dd\n"
+        "\u5b8c\u6210\u6d3b\u52d5\u5373\u53ef\u53d6\u5f97 \u6708\u5149\u795d\u798f \u5957\u88dd\n"
+        "\u65b0\u589e\u5957\u88dd"
+    )
+
+    assert [suit.name for suit in suits] == [
+        "\u6696\u5fc3\u871c\u610f",
+        "\u6d77\u6c99\u66a2\u60f3",
+        "\u661f\u591c\u82b1\u5712",
+        "\u9727\u4e2d\u82b1\u5712",
+        "\u6708\u5149\u795d\u798f",
+    ]
+    assert not is_valid_suit_name("\u65b0\u589e")

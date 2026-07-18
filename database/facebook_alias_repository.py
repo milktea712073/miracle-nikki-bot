@@ -102,13 +102,14 @@ def _move_parse_drafts(
     connection: sqlite3.Connection, survivor_raw_post_id: int, duplicate_raw_post_id: int
 ) -> None:
     status_priority = {"approved": 5, "reviewed": 4, "auto": 3, "pending": 2, "failed": 1}
-    for duplicate_draft_id, parser_version, duplicate_status in connection.execute(
-        "SELECT id, parser_version, status FROM parse_drafts WHERE raw_post_id = ?",
+    for duplicate_draft_id, parser_version, section_hash, splitter_version, duplicate_status in connection.execute(
+        "SELECT id, parser_version, section_hash, splitter_version, status FROM parse_drafts WHERE raw_post_id = ?",
         (duplicate_raw_post_id,),
     ).fetchall():
         existing = connection.execute(
-            "SELECT id, status FROM parse_drafts WHERE raw_post_id = ? AND parser_version = ?",
-            (survivor_raw_post_id, parser_version),
+            "SELECT id, status FROM parse_drafts WHERE raw_post_id = ? AND parser_version = ? "
+            "AND section_hash = ? AND splitter_version = ?",
+            (survivor_raw_post_id, parser_version, section_hash, splitter_version),
         ).fetchone()
         if existing is None:
             connection.execute(

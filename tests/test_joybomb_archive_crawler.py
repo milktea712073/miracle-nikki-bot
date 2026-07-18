@@ -31,7 +31,9 @@ V2_HTML = """
 ARCHIVED_V1_HTML = """
 <html><body><div class='nav'>Navigation</div><div class='content_bg'>
 <div class='news_bg_title'></div><h1>Archived Official Notice</h1><span>2019.08.21 18:00</span>
-<p>Official body text.</p><img src='/upload/notice.jpg'></div><footer>Footer</footer></body></html>
+<p>Official body text.</p><p>活動期間：2019.08.22 05:00 至 2019.08.28 23:59</p>
+<a href='/notice/noticelist'>返回公告列表</a><div class='notice-footer'><span>Fixed notice footer</span></div>
+<img src='/upload/notice.jpg'></div><footer>Footer</footer></body></html>
 """
 
 
@@ -113,7 +115,10 @@ def test_parse_actual_joybomb_content_bg_template() -> None:
     assert notice.template_signature == "joybomb_notice_v1"
     assert notice.title == "Archived Official Notice"
     assert notice.published_at == "2019-08-21T00:00:00+00:00"
-    assert notice.content_text == "Archived Official Notice\n2019.08.21 18:00\nOfficial body text."
+    assert "Archived Official Notice" in notice.content_html
+    assert notice.content_text == "Official body text.\n活動期間：2019.08.22 05:00 至 2019.08.28 23:59"
+    assert "返回公告列表" not in notice.content_text
+    assert "Fixed notice footer" not in notice.content_text
 
 
 def test_parse_v2_and_unknown_template_are_explicit() -> None:

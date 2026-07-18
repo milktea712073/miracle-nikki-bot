@@ -49,16 +49,48 @@ class KnowledgeRepository:
     def update_event(self, connection: sqlite3.Connection, event_id: int, official_series: str | None, event_type_id: int | None, description: str | None) -> None:
         connection.execute("UPDATE events SET official_series = ?, event_type_id = ?, description = ?, updated_at = ? WHERE id = ?", (official_series, event_type_id, description, utc_now_iso8601(), event_id))
 
+    def rename_auto_event(
+        self, connection: sqlite3.Connection, event_id: int, name: str
+    ) -> bool:
+        """Rename only an automatically created event without touching relations."""
+        result = connection.execute(
+            """
+            UPDATE events
+            SET name = ?, updated_at = ?, updated_via = 'parser'
+            WHERE id = ? AND data_status = 'auto' AND name != ?
+            """,
+            (name, utc_now_iso8601(), event_id, name),
+        )
+        return result.rowcount == 1
+
     def find_event_by_source_raw_post_id(
-        self, connection: sqlite3.Connection, source_raw_post_id: int | None
+        self,
+        connection: sqlite3.Connection,
+        source_raw_post_id: int | None,
+        source_section_hash: str | None = None,
+        source_splitter_version: str | None = None,
     ) -> int | None:
-        """Find the event created from one raw post, never by display name."""
+        """Find an event by its source identity, never by display name.
+
+        Legacy sources retain one event per raw post.  Section-aware sources add
+        the stable splitter fingerprint so independent sections from one notice
+        cannot collapse into the same event.
+        """
         if source_raw_post_id is None:
             return None
-        row = connection.execute(
-            "SELECT id FROM events WHERE source_raw_post_id = ? ORDER BY id LIMIT 1",
-            (source_raw_post_id,),
-        ).fetchone()
+        if source_section_hash is None or source_splitter_version is None:
+            row = connection.execute(
+                "SELECT id FROM events WHERE source_raw_post_id = ? "
+                "AND source_section_hash IS NULL ORDER BY id LIMIT 1",
+                (source_raw_post_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT id FROM events WHERE source_raw_post_id = ? "
+                "AND source_section_hash = ? AND source_splitter_version = ? "
+                "ORDER BY id LIMIT 1",
+                (source_raw_post_id, source_section_hash, source_splitter_version),
+            ).fetchone()
         return int(row[0]) if row else None
 
     def create_event(
@@ -69,11 +101,14 @@ class KnowledgeRepository:
         event_type_id: int | None,
         description: str | None,
         source_raw_post_id: int | None = None,
+        source_section_hash: str | None = None,
+        source_splitter_version: str | None = None,
     ) -> int:
         now = utc_now_iso8601()
         cursor = connection.execute(
-            "INSERT INTO events (name, official_series, event_type_id, description, created_at, updated_at, source_raw_post_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events (name, official_series, event_type_id, description, created_at, updated_at, "
+            "source_raw_post_id, source_section_hash, source_splitter_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 official_series,
@@ -82,6 +117,8 @@ class KnowledgeRepository:
                 now,
                 now,
                 source_raw_post_id,
+                source_section_hash,
+                source_splitter_version,
             ),
         )
         return int(cursor.lastrowid)
@@ -94,27 +131,48 @@ class KnowledgeRepository:
         description: str | None,
         raw_post_id: int,
         content_type: str = "event",
+        source_section_hash: str | None = None,
+        source_splitter_version: str | None = None,
     ) -> int:
         """Create or safely enrich an automatically parsed event.
 
         A verified record is never modified by parser output.  For an auto record,
         parser values only replace fields when a concrete value is available.
         """
-        row = connection.execute(
-            "SELECT id, data_status FROM events WHERE source_raw_post_id = ? "
-            "ORDER BY id LIMIT 1",
-            (raw_post_id,),
-        ).fetchone()
+        event_id = self.find_event_by_source_raw_post_id(
+            connection,
+            raw_post_id,
+            source_section_hash,
+            source_splitter_version,
+        )
+        row = (
+            connection.execute(
+                "SELECT id, data_status FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if event_id is not None
+            else None
+        )
         now = utc_now_iso8601()
         if row is None:
             cursor = connection.execute(
                 """
                 INSERT INTO events (
                     name, official_series, description, content_type, created_at, updated_at,
-                    data_status, source_raw_post_id, created_via, updated_via
-                ) VALUES (?, ?, ?, ?, ?, ?, 'auto', ?, 'auto', 'parser')
+                    data_status, source_raw_post_id, source_section_hash,
+                    source_splitter_version, created_via, updated_via
+                ) VALUES (?, ?, ?, ?, ?, ?, 'auto', ?, ?, ?, 'auto', 'parser')
                 """,
-                (name, official_series, description, content_type, now, now, raw_post_id),
+                (
+                    name,
+                    official_series,
+                    description,
+                    content_type,
+                    now,
+                    now,
+                    raw_post_id,
+                    source_section_hash,
+                    source_splitter_version,
+                ),
             )
             return int(cursor.lastrowid)
         event_id, data_status = int(row[0]), str(row[1])

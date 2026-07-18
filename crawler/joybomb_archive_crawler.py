@@ -8,6 +8,7 @@ and writes local reports for a later source-quality decision.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import re
@@ -40,6 +41,10 @@ WAYBACK_REWRITTEN_URL_PATTERN = re.compile(
     r"^https?://web\.archive\.org/web/\d+(?:[a-z_]+)?/(https?://.+)$", re.I
 )
 DATE_PATTERN = re.compile(r"(20\d{2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})")
+_DATE_ONLY_NODE_PATTERN = re.compile(
+    r"^\s*20\d{2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{1,2}(?:\s+\d{1,2}:\d{2})?\s*$"
+)
+_PAGE_CHROME_TEXT = frozenset({"返回公告列表", "回公告列表", "返回列表", "公告列表"})
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 CDX_URL_PATTERNS = (
     # CDX wildcard behaviour differs for path and query-style URL families;
@@ -379,6 +384,21 @@ def _first_text(nodes: Iterable[Tag]) -> str | None:
     return None
 
 
+def _extract_notice_title(container: Tag) -> str | None:
+    """Prefer a concrete title child over a metadata-bearing title wrapper."""
+    for selector in (
+        ".noticeTitle h5, .notice-title h5",
+        ".noticeTitle h1, .notice-title h1",
+        ".noticeTitle h2, .notice-title h2",
+        "h1, h2",
+        ".notice-title, .noticeTitle",
+    ):
+        title = _first_text(container.select(selector))
+        if title:
+            return title
+    return None
+
+
 def _parse_date(value: str | None) -> str | None:
     if not value:
         return None
@@ -387,6 +407,51 @@ def _parse_date(value: str | None) -> str | None:
         return None
     year, month, day = (int(part) for part in match.groups())
     return datetime(year, month, day, tzinfo=UTC).isoformat()
+
+
+def _clean_notice_body_root(content_root: Tag, *, title: str | None) -> Tag:
+    """Return a cloned content root with only clear notice chrome removed.
+
+    ``content_html`` remains the original archived fragment for later audit.  This
+    helper is intentionally limited to title/date nodes and explicit navigation
+    or footer markup, so dates and prose inside the actual notice body survive.
+    """
+    body_root = copy.copy(content_root)
+    normalized_title = title.strip() if title else None
+
+    for node in list(body_root.select("h1, h2, .notice-title, .noticeTitle")):
+        if normalized_title and node.get_text(" ", strip=True) == normalized_title:
+            node.decompose()
+
+    for node in list(body_root.select("time, .notice-date, .noticeDate")):
+        node.decompose()
+
+    for node in list(body_root.select(".date, .time")):
+        if _DATE_ONLY_NODE_PATTERN.fullmatch(node.get_text(" ", strip=True)):
+            node.decompose()
+
+    for node in list(body_root.find_all(["span", "div", "p"])):
+        if node.find(True) is None and _DATE_ONLY_NODE_PATTERN.fullmatch(node.get_text(" ", strip=True)):
+            node.decompose()
+
+    for node in list(body_root.find_all(["a", "button", "span", "div", "p"])):
+        # A previously removed ancestor leaves already-enumerated descendants
+        # as inert BeautifulSoup tags.
+        if node.attrs is None:
+            continue
+        text = node.get_text(" ", strip=True)
+        if text in _PAGE_CHROME_TEXT or _has_class_token(
+            node,
+            "notice-footer",
+            "notice-nav",
+            "notice-list",
+            "return-list",
+            "back-list",
+            "breadcrumb",
+            "page-footer",
+        ):
+            node.decompose()
+    return body_root
 
 
 def parse_notice_document(snapshot: CdxSnapshot, document: str) -> JoyBombArchiveNotice:
@@ -415,7 +480,7 @@ def parse_notice_document(snapshot: CdxSnapshot, document: str) -> JoyBombArchiv
         )
 
     container = content_root.parent if isinstance(content_root.parent, Tag) else content_root
-    title = _first_text(container.select(".notice-title, .noticeTitle, h1, h2"))
+    title = _extract_notice_title(container)
     date_text = _first_text(container.select("time, .notice-date, .noticeDate, .date, .time"))
     if not date_text:
         date_text = container.get_text(" ", strip=True)
@@ -430,7 +495,7 @@ def parse_notice_document(snapshot: CdxSnapshot, document: str) -> JoyBombArchiv
         absolute = unwrap_wayback_url(urljoin(snapshot.original_url, src.strip()))
         if absolute not in image_original_urls:
             image_original_urls.append(absolute)
-    content_text = content_root.get_text("\n", strip=True)
+    content_text = _clean_notice_body_root(content_root, title=title).get_text("\n", strip=True)
     return JoyBombArchiveNotice(
         archive_timestamp=snapshot.timestamp,
         original_url=snapshot.original_url,

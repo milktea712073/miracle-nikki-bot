@@ -935,25 +935,21 @@ class KnowledgeQueryRepository:
         return None
 
     def get_raw_images_for_event(self, event_id: int) -> list[RawPostImageView]:
-        """List stored announcement images matching an event for image assignment."""
+        """List stored announcement images for the event's source raw post."""
         connection = self._connect()
         try:
-            event_row = connection.execute(
-                "SELECT name FROM events WHERE id = ?", (event_id,)
-            ).fetchone()
-            if event_row is None:
-                return []
             try:
                 rows = connection.execute(
                     """
                     SELECT raw_post_images.id, raw_post_images.image_url
-                    FROM raw_posts
-                    JOIN raw_post_images ON raw_post_images.raw_post_id = raw_posts.id
-                    WHERE raw_posts.content LIKE ?
-                    ORDER BY raw_posts.published_at DESC, raw_posts.id DESC,
-                             raw_post_images.position ASC
+                    FROM events
+                    JOIN raw_post_images
+                      ON raw_post_images.raw_post_id = events.source_raw_post_id
+                    WHERE events.id = ?
+                      AND events.source_raw_post_id IS NOT NULL
+                    ORDER BY raw_post_images.position ASC, raw_post_images.id ASC
                     """,
-                    (f"%{event_row[0]}%",),
+                    (event_id,),
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []

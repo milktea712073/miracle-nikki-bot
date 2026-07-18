@@ -32,6 +32,14 @@ class RawPostSaveResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RawContentRefreshResult:
+    """The result of replacing parser input for one existing raw post."""
+
+    raw_post_id: int
+    action: Literal["updated", "unchanged"]
+
+
+@dataclass(frozen=True, slots=True)
 class RawPostFailure:
     """A post that could not be persisted during a batch."""
 
@@ -127,6 +135,97 @@ class RawPostRepository:
         """Return whether one source-specific post was already persisted."""
         return self.get_raw_post_by_source_id(source_post_id, source=source) is not None
 
+    def list_raw_posts_for_content_refresh(self, *, source: str) -> list[dict[str, object]]:
+        """Return the immutable raw fields needed to rebuild parser input offline."""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, source, source_post_id, url, content, published_at, metadata_json "
+                "FROM raw_posts WHERE source = ? ORDER BY id",
+                (source,),
+            ).fetchall()
+            return [
+                {
+                    "id": int(row[0]),
+                    "source": str(row[1]),
+                    "source_post_id": str(row[2]),
+                    "url": str(row[3]),
+                    "content": str(row[4]),
+                    "published_at": row[5],
+                    "metadata_json": row[6],
+                }
+                for row in rows
+            ]
+        finally:
+            connection.close()
+
+    def refresh_existing_raw_content(
+        self,
+        raw_post_id: int,
+        content: str,
+        *,
+        expected_source: str,
+    ) -> RawContentRefreshResult:
+        """Update only parser input for one existing source row.
+
+        Metadata, publication time, images, identity, and announcement state are
+        deliberately untouched.  A changed content hash marks only this raw post
+        pending so its derived drafts can be synchronized on the next parse run.
+        """
+        cleaned_content = content.strip()
+        if not cleaned_content:
+            raise ValueError("Refusing to replace raw content with an empty value.")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT source, source_post_id, url, content, published_at, metadata_json "
+                "FROM raw_posts WHERE id = ?",
+                (raw_post_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Raw post {raw_post_id} was not found.")
+            if row[0] != expected_source:
+                raise ValueError(
+                    f"Raw post {raw_post_id} belongs to {row[0]!r}, not {expected_source!r}."
+                )
+            if row[3] == cleaned_content:
+                connection.commit()
+                return RawContentRefreshResult(raw_post_id, "unchanged")
+
+            metadata = json.loads(row[5]) if row[5] else None
+            published_at = datetime.fromisoformat(row[4]) if row[4] else None
+            images = [
+                image_row[0]
+                for image_row in connection.execute(
+                    "SELECT image_url FROM raw_post_images WHERE raw_post_id = ? ORDER BY position",
+                    (raw_post_id,),
+                ).fetchall()
+            ]
+            content_hash = compute_content_hash(
+                Post(
+                    post_id=str(row[1]),
+                    url=str(row[2]),
+                    content=cleaned_content,
+                    published_at=published_at,
+                    images=images,
+                    source=str(row[0]),
+                    metadata=metadata,
+                )
+            )
+            connection.execute(
+                "UPDATE raw_posts SET content = ?, content_hash = ?, updated_at = ?, "
+                "parse_status = 'pending', parse_error = NULL WHERE id = ?",
+                (cleaned_content, content_hash, utc_now_iso8601(), raw_post_id),
+            )
+            connection.commit()
+            return RawContentRefreshResult(raw_post_id, "updated")
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def get_raw_post_by_source_id(
         self, source_post_id: str, *, source: str = SOURCE_FACEBOOK
     ) -> dict[str, object] | None:
@@ -172,14 +271,15 @@ class RawPostRepository:
         )
 
     @staticmethod
-    def _metadata_is_verified(metadata_json: object) -> bool:
+    def _metadata_is_explicitly_unverified(metadata_json: object) -> bool:
+        """Return whether a legacy row explicitly says it is not an official post."""
         if not isinstance(metadata_json, str) or not metadata_json:
             return False
         try:
             metadata = json.loads(metadata_json)
         except json.JSONDecodeError:
             return False
-        return isinstance(metadata, dict) and bool(metadata.get("official_post_verified"))
+        return isinstance(metadata, dict) and metadata.get("official_post_verified") is False
 
     def _images_for_raw_post(self, connection: sqlite3.Connection, raw_post_id: int) -> list[str]:
         return [
@@ -198,7 +298,14 @@ class RawPostRepository:
         published_at: str | None,
         images: list[str],
     ) -> bool:
-        """Require all independent trusted signals before automatic pfbid merging."""
+        """Require trusted incoming evidence and exact independent alias signals.
+
+        Older rows predate ``official_post_verified`` metadata.  Absence of that
+        field is therefore unknown, not a rejection: a newly verified official
+        post can safely claim the legacy row only when content, media identity,
+        and publication metadata all match.  An explicit ``False`` remains a
+        hard stop.
+        """
         if not self._is_verified_facebook_post(post):
             return False
         existing_id = int(existing[0])
@@ -206,7 +313,7 @@ class RawPostRepository:
         existing_published_at = existing[5]
         existing_metadata = existing[6]
         return (
-            self._metadata_is_verified(existing_metadata)
+            not self._metadata_is_explicitly_unverified(existing_metadata)
             and existing_content == post.content
             and stable_image_filenames(self._images_for_raw_post(connection, existing_id))
             == stable_image_filenames(images)
@@ -278,6 +385,7 @@ class RawPostRepository:
         post_url = canonical_announcement_url(post.url)
         metadata_json = json.dumps(post.metadata, ensure_ascii=False, sort_keys=True) if post.metadata else None
         now = utc_now_iso8601()
+        should_enqueue_new_facebook_post = False
         connection = self._connect()
         try:
             connection.execute("BEGIN")
@@ -344,14 +452,7 @@ class RawPostRepository:
                 )
                 raw_post_id = int(cursor.lastrowid)
                 action: SaveAction = "inserted"
-                if source == SOURCE_FACEBOOK:
-                    AnnouncementJobRepository.create_pending_for_new_raw_post(
-                        connection,
-                        raw_post_id,
-                        post_url,
-                        now,
-                        enqueue=enqueue_announcement,
-                    )
+                should_enqueue_new_facebook_post = source == SOURCE_FACEBOOK
             else:
                 raw_post_id = int(existing[0])
                 # An alias already proves this pfbid maps to the same source post.
@@ -386,6 +487,16 @@ class RawPostRepository:
                 action = "updated"
 
             self._insert_images(connection, raw_post_id, images, now)
+            if should_enqueue_new_facebook_post:
+                # The queue guard compares stable media identity, so enqueue only
+                # after this new raw post's complete image set is persisted.
+                AnnouncementJobRepository.create_pending_for_new_raw_post(
+                    connection,
+                    raw_post_id,
+                    post_url,
+                    now,
+                    enqueue=enqueue_announcement,
+                )
             connection.commit()
             return RawPostSaveResult(post.post_id, action, raw_post_id)
         except Exception:

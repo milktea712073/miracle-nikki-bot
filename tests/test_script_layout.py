@@ -13,11 +13,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_MODULES = (
     "scripts.data.fetch_raw_posts",
     "scripts.data.fetch_website_posts",
+    "scripts.data.import_joybomb_archive",
     "scripts.data.parse_raw_posts",
     "scripts.data.reset_database",
     "scripts.data.rebuild_database",
     "scripts.data.cleanup_auto_suits",
     "scripts.data.repair_facebook_post_aliases",
+    "scripts.data.repair_joybomb_long_event_names",
+    "scripts.data.repair_pending_draft_suits",
     "scripts.announcement.initialize_announcement_queue",
     "scripts.announcement.baseline_announcements",
     "scripts.announcement.migrations.migrate_announcement_baseline",
@@ -28,6 +31,10 @@ SCRIPT_MODULES = (
     "scripts.diagnostic.facebook_feed_network_diagnostic",
     "scripts.diagnostic.debug_facebook_mobile",
     "scripts.diagnostic.debug_facebook_post_sources",
+    "scripts.diagnostic.section_split_diagnostic",
+    "scripts.diagnostic.story_event_match_diagnostic",
+    "scripts.diagnostic.export_joybomb_draft_report",
+    "scripts.diagnostic.export_joybomb_draft_suit_classification",
     "scripts.legacy.review_drafts",
 )
 
