@@ -46,9 +46,6 @@ class FakeRepository:
     def get_event_by_name(self, _name: str) -> EventView:
         return EventView(1, "測試活動", None, None, None, [], [], None, None)
 
-    def get_announcement_image_for_event(self, _name: str) -> None:
-        return None
-
     def get_events_by_name(self, _name: str) -> list[EventView]:
         return [EventView(1, "測試活動", None, None, None, [], [], None, None)]
 

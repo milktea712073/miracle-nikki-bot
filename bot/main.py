@@ -307,15 +307,18 @@ def create_suit_embed(
     """Build a compact suit card from its latest event relation."""
     embed = discord.Embed(title=f"👗 {suit.name}", color=discord.Color.from_rgb(255, 183, 197))
     lines = ["✨ Live2D"] if suit.is_live2d else []
-    if suit.series_names:
-        lines.append(f"🏛️ 所屬系列：{'、'.join(suit.series_names)}")
-        category = next((event.event_type for event in suit.events if event.event_type), None)
+    series_events = [event for event in suit.events if event.series_name]
+    regular_events = [event for event in suit.events if not event.series_name]
+    if series_events:
+        series_names = list(dict.fromkeys(event.series_name for event in series_events if event.series_name))
+        lines.append(f"🏛️ 所屬系列：{'、'.join(series_names)}")
+        category = next((event.event_type for event in series_events if event.event_type), None)
         if category:
             lines.append(f"🏷️ 活動分類：{category}")
         elif show_missing_category:
             lines.append("🏷️ 活動分類：尚未設定")
-    elif suit.events:
-        event = suit.events[0]
+    if regular_events:
+        event = regular_events[0]
         lines.append(f"📚 所屬活動：{event.event_name}")
         if event.event_type:
             lines.append(f"🏷️ 活動分類：{event.event_type}")

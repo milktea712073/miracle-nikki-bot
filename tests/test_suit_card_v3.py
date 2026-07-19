@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pytest
 
-from bot.admin.knowledge_image_views import ImagePreviewView, create_image_preview_embed
 from bot.admin.knowledge_suit_views import (
     ReturnSuitCardView,
     SuitRelationSelectView,
@@ -187,9 +186,6 @@ def test_suit_card_without_image_is_valid(tmp_path):
     seed_suit(database_path)
     suit, embed = get_suit_card(database_path)
 
-    assert KnowledgeQueryRepository(database_path).get_announcement_image_for_events(
-        [event.event_name for event in suit.events]
-    ) is None
     assert embed.image.url is None
 
 
@@ -205,43 +201,6 @@ def test_multi_suit_event_does_not_fallback_to_activity_image(tmp_path):
     assert suit is not None
 
     assert repository.get_display_image_for_suit(suit.id) is None
-
-
-def test_assigned_primary_suit_image_is_displayed(tmp_path):
-    database_path = tmp_path / "assigned-image.db"
-    expected_url = "https://example.test/suit-image.jpg"
-    seed_suit(database_path, suit_count=2, image_url=expected_url)
-    repository = KnowledgeQueryRepository(database_path)
-    suit = repository.get_suit_by_name("山")
-    assert suit is not None
-    event = repository.get_event_by_name("風林火山")
-    assert event is not None
-    raw_image = repository.get_raw_images_for_event(event.id)[0]
-
-    repository.assign_primary_image_to_suit(suit.id, raw_image.id)
-
-    assert repository.get_primary_image_for_suit(suit.id) == expected_url
-    assert repository.get_display_image_for_suit(suit.id) == expected_url
-
-
-def test_assigned_image_is_not_reused_for_another_suit(tmp_path):
-    database_path = tmp_path / "separate-images.db"
-    seed_suit(
-        database_path,
-        suit_count=2,
-        image_url="https://example.test/first-suit-image.jpg",
-    )
-    repository = KnowledgeQueryRepository(database_path)
-    first_suit = repository.get_suit_by_name("山")
-    second_suit = repository.get_suit_by_name("副套1")
-    event = repository.get_event_by_name("風林火山")
-    assert first_suit is not None and second_suit is not None and event is not None
-    raw_image = repository.get_raw_images_for_event(event.id)[0]
-
-    repository.assign_primary_image_to_suit(first_suit.id, raw_image.id)
-
-    assert repository.get_display_image_for_suit(first_suit.id) == raw_image.image_url
-    assert repository.get_display_image_for_suit(second_suit.id) is None
 
 
 def test_event_card_uses_date_only_activity_records(tmp_path):
@@ -343,59 +302,6 @@ def test_non_mansion_suit_cannot_enable_live2d(tmp_path):
     suit = repository.get_suit_by_name("山")
     assert suit is not None
     assert suit.is_live2d is False
-
-
-def test_image_preview_starts_with_the_first_actual_image(tmp_path):
-    database_path = tmp_path / "suit-image-picker.db"
-    seed_suit(database_path, image_url="https://example.test/suit.jpg")
-    repository = KnowledgeQueryRepository(database_path)
-    suit = repository.get_suit_by_name("山")
-    event = repository.get_event_by_name("風林火山")
-    assert suit is not None and event is not None
-    images = repository.get_raw_images_for_event(event.id)
-
-    view = ImagePreviewView(suit.id, suit.name, event.name, images, owner_user_id=1)
-
-    assert view.suit_id == suit.id
-    assert view.embed().image.url == "https://example.test/suit.jpg"
-    assert "圖片：1 / 1" in view.embed().description
-
-
-def test_image_preview_next_and_previous_select_the_expected_image(tmp_path):
-    database_path = tmp_path / "preview-navigation.db"
-    seed_suit(database_path, image_url="https://example.test/first.jpg")
-    connection = get_connection(database_path)
-    try:
-        raw_post_id = connection.execute("SELECT id FROM raw_posts").fetchone()[0]
-        connection.execute(
-            "INSERT INTO raw_post_images (raw_post_id, image_url, position, created_at) VALUES (?, ?, 1, '2026-01-01T00:00:00+00:00')",
-            (raw_post_id, "https://example.test/second.jpg"),
-        )
-        connection.commit()
-    finally:
-        connection.close()
-    repository = KnowledgeQueryRepository(database_path)
-    suit = repository.get_suit_by_name("山")
-    event = repository.get_event_by_name("風林火山")
-    assert suit is not None and event is not None
-    images = repository.get_raw_images_for_event(event.id)
-    view = ImagePreviewView(suit.id, suit.name, event.name, images, owner_user_id=1)
-
-    view.index = 1
-    view.previous.disabled = False
-    view.next.disabled = True
-    assert view.embed().image.url == "https://example.test/second.jpg"
-    view.index = 0
-    assert view.embed().image.url == "https://example.test/first.jpg"
-
-
-def test_image_preview_marks_an_invalid_url_without_raising():
-    image = type("RawImage", (), {"id": 1, "image_url": "not-a-valid-url"})()
-
-    embed = create_image_preview_embed("元氣應援", "奇迹演唱會", [image], 0)
-
-    assert embed.image.url is None
-    assert any(field.value == "此圖片目前無法預覽。" for field in embed.fields)
 
 
 def test_suit_image_management_uses_suit_owned_pages_not_event_sources(tmp_path):

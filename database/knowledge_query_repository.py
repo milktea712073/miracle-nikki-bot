@@ -64,12 +64,14 @@ class SuitPeriodView:
 class SuitEventView:
     """An event in which a suit is available, including all its periods."""
 
+    event_id: int
     event_name: str
     event_type: str | None
     acquisition_method: str | None
     cost_text: str | None
     periods: list[SuitPeriodView]
     appearance_status: str = "unknown"
+    series_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,22 +86,6 @@ class SuitView:
     events: list[SuitEventView]
     data_status: str = "auto"
     series_names: list[str] = field(default_factory=list)
-
-
-@dataclass(frozen=True, slots=True)
-class RawPostImageView:
-    """One stored raw Facebook image available for administrator assignment."""
-
-    id: int
-    image_url: str
-
-
-@dataclass(frozen=True, slots=True)
-class SuitImageCandidate:
-    """A suit that belongs to an event being configured."""
-
-    id: int
-    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1016,6 +1002,7 @@ class KnowledgeQueryRepository:
                 SELECT
                     e.id,
                     e.name,
+                    series.name,
                     et.name,
                     am.name,
                     single_suit_cost.cost_text,
@@ -1038,6 +1025,7 @@ class KnowledgeQueryRepository:
                     ) AS latest_period_start
                 FROM event_suits AS es
                 JOIN events AS e ON e.id = es.event_id
+                LEFT JOIN series ON series.event_id = e.id AND series.is_active = 1
                 LEFT JOIN event_types AS et ON et.id = e.event_type_id
                 LEFT JOIN acquisition_methods AS am ON am.id = es.acquisition_method_id
                 LEFT JOIN cost_records AS single_suit_cost
@@ -1057,6 +1045,7 @@ class KnowledgeQueryRepository:
             for (
                 event_id,
                 event_name,
+                series_name,
                 event_type,
                 acquisition_method,
                 single_suit_cost,
@@ -1080,24 +1069,16 @@ class KnowledgeQueryRepository:
                     cost_text = event_total_cost
                 events.append(
                     SuitEventView(
+                        event_id=int(event_id),
                         event_name=str(event_name),
                         event_type=event_type,
                         acquisition_method=acquisition_method,
                         cost_text=cost_text,
                         periods=[SuitPeriodView(*period) for period in period_rows],
                         appearance_status=str(appearance_status or "unknown"),
+                        series_name=str(series_name) if series_name else None,
                     )
                 )
-            series_rows = connection.execute(
-                """
-                SELECT series.name
-                FROM event_suits
-                JOIN series ON series.event_id = event_suits.event_id
-                WHERE event_suits.suit_id = ? AND series.is_active = 1
-                ORDER BY series.display_order, series.name
-                """,
-                (suit_id,),
-            ).fetchall()
             return SuitView(
                 id=int(suit_id),
                 name=str(suit_name),
@@ -1106,7 +1087,9 @@ class KnowledgeQueryRepository:
                 description=description,
                 events=events,
                 data_status=str(data_status),
-                series_names=[str(series_name) for (series_name,) in series_rows],
+                series_names=list(dict.fromkeys(
+                    event.series_name for event in events if event.series_name
+                )),
             )
         finally:
             connection.close()
@@ -1163,32 +1146,6 @@ class KnowledgeQueryRepository:
         """Return a small list of matching suit names for command suggestions."""
         return self._search_names("suits", query, limit)
 
-    def get_announcement_image_for_event(self, event_name: str) -> str | None:
-        """Return the first stored raw-announcement image matching an event name.
-
-        This is a display-only fallback until the knowledge base has dedicated
-        event or suit image fields.
-        """
-        connection = self._connect()
-        try:
-            try:
-                row = connection.execute(
-                    """
-                    SELECT raw_post_images.image_url
-                    FROM raw_posts
-                    JOIN raw_post_images ON raw_post_images.raw_post_id = raw_posts.id
-                    WHERE raw_posts.content LIKE ?
-                    ORDER BY raw_posts.published_at DESC, raw_post_images.position ASC
-                    LIMIT 1
-                    """,
-                    (f"%{event_name.strip()}%",),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                return None
-            return str(row[0]) if row else None
-        finally:
-            connection.close()
-
     def get_announcement_image_for_event_id(self, event_id: int) -> str | None:
         """Return the first image from the raw post that created this event."""
         connection = self._connect()
@@ -1208,14 +1165,6 @@ class KnowledgeQueryRepository:
             return str(row[0]) if row else None
         finally:
             connection.close()
-
-    def get_announcement_image_for_events(self, event_names: list[str]) -> str | None:
-        """Return the first available announcement image among related events."""
-        for event_name in event_names:
-            image_url = self.get_announcement_image_for_event(event_name)
-            if image_url:
-                return image_url
-        return None
 
     def get_primary_image_for_suit(self, suit_id: int) -> str | None:
         """Return the explicitly assigned primary image for a suit, if any."""
@@ -1239,177 +1188,9 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
-    def get_primary_image_for_series(self, series_id: int) -> str | None:
-        """Return the first shared suit image in a Series's display order."""
-        connection = self._connect()
-        try:
-            row = connection.execute(
-                """
-                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
-                FROM series_contents
-                JOIN suit_images ON suit_images.suit_id = series_contents.suit_id
-                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
-                WHERE series_contents.series_id = ?
-                ORDER BY CASE series_contents.type
-                    WHEN 'main' THEN 0
-                    WHEN 'live2d' THEN 1
-                    WHEN 'minor' THEN 2
-                    ELSE 3
-                END, series_contents.display_order, suit_images.is_primary DESC,
-                suit_images.display_order, suit_images.id
-                LIMIT 1
-                """,
-                (series_id,),
-            ).fetchone()
-            return str(row[0]) if row and row[0] else None
-        finally:
-            connection.close()
-
-    def get_primary_image_for_event(self, event_id: int) -> str | None:
-        """Read card media solely through EventSuit and SuitImages."""
-        connection = self._connect()
-        try:
-            row = connection.execute(
-                """
-                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
-                FROM event_suits
-                JOIN suit_images ON suit_images.suit_id = event_suits.suit_id
-                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
-                WHERE event_suits.event_id = ?
-                ORDER BY event_suits.display_order, suit_images.is_primary DESC,
-                    suit_images.display_order, suit_images.id
-                LIMIT 1
-                """,
-                (event_id,),
-            ).fetchone()
-            return str(row[0]) if row and row[0] else None
-        finally:
-            connection.close()
-
-    def get_series_image_urls(self, series_id: int) -> list[str]:
-        """List shared suit-image URLs once, in Series display order."""
-        connection = self._connect()
-        try:
-            rows = connection.execute(
-                """
-                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
-                FROM series_contents
-                JOIN suit_images ON suit_images.suit_id = series_contents.suit_id
-                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
-                WHERE series_contents.series_id = ?
-                ORDER BY CASE series_contents.type
-                    WHEN 'main' THEN 0
-                    WHEN 'live2d' THEN 1
-                    WHEN 'minor' THEN 2
-                    ELSE 3
-                END, series_contents.display_order, suit_images.display_order, suit_images.id
-                """,
-                (series_id,),
-            ).fetchall()
-            return list(dict.fromkeys(str(url) for (url,) in rows if url))
-        finally:
-            connection.close()
-
     def get_display_image_for_suit(self, suit_id: int) -> str | None:
         """Return the Suit-owned image without inferring one from raw posts."""
         return self.get_primary_image_for_suit(suit_id)
-
-    def get_raw_images_for_event(self, event_id: int) -> list[RawPostImageView]:
-        """List stored announcement images for the event's source raw post."""
-        connection = self._connect()
-        try:
-            try:
-                rows = connection.execute(
-                    """
-                    SELECT raw_post_images.id, raw_post_images.image_url
-                    FROM events
-                    JOIN raw_post_images
-                      ON raw_post_images.raw_post_id = events.source_raw_post_id
-                    WHERE events.id = ?
-                      AND events.source_raw_post_id IS NOT NULL
-                    ORDER BY raw_post_images.position ASC, raw_post_images.id ASC
-                    """,
-                    (event_id,),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                return []
-            return [RawPostImageView(int(image_id), str(image_url)) for image_id, image_url in rows]
-        finally:
-            connection.close()
-
-    def get_event_suits_for_image_assignment(self, event_id: int) -> list[SuitImageCandidate]:
-        """Return suits eligible to receive one of an event's raw images."""
-        connection = self._connect()
-        try:
-            rows = connection.execute(
-                """
-                SELECT suits.id, suits.name
-                FROM event_suits
-                JOIN suits ON suits.id = event_suits.suit_id
-                WHERE event_suits.event_id = ?
-                ORDER BY event_suits.display_order, event_suits.id
-                """,
-                (event_id,),
-            ).fetchall()
-            return [SuitImageCandidate(int(suit_id), str(name)) for suit_id, name in rows]
-        finally:
-            connection.close()
-
-    def assign_primary_image_to_suit(self, suit_id: int, raw_post_image_id: int) -> None:
-        """Assign a stored raw image as the suit's sole primary image atomically."""
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN")
-            connection.execute(
-                "UPDATE suit_images SET is_primary = 0 WHERE suit_id = ?", (suit_id,)
-            )
-            next_position = connection.execute(
-                "SELECT COALESCE(MAX(display_order) + 1, 0) FROM suit_images WHERE suit_id = ?",
-                (suit_id,),
-            ).fetchone()[0]
-            connection.execute(
-                """
-                INSERT INTO suit_images (suit_id, raw_post_image_id, display_order, is_primary)
-                VALUES (?, ?, ?, 1)
-                ON CONFLICT(suit_id, raw_post_image_id)
-                DO UPDATE SET is_primary = 1
-                """,
-                (suit_id, raw_post_image_id, next_position),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def save_series_images(self, series_id: int, urls: list[str]) -> None:
-        """Replace the shared image list for every suit linked to one fixed Series."""
-        normalized_urls = list(dict.fromkeys(url.strip() for url in urls if url.strip()))
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN")
-            suit_ids = [
-                int(suit_id)
-                for (suit_id,) in connection.execute(
-                    "SELECT suit_id FROM series_contents WHERE series_id = ? ORDER BY id",
-                    (series_id,),
-                ).fetchall()
-            ]
-            if normalized_urls and not suit_ids:
-                raise ValueError("請先建立至少一個套裝，再設定共用圖片。")
-            for suit_id in suit_ids:
-                self._replace_suit_images(connection, suit_id, normalized_urls)
-            connection.execute(
-                "UPDATE series SET updated_at = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), series_id),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def get_suit_image_urls(self, suit_id: int) -> list[str]:
         connection = self._connect()

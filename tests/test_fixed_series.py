@@ -289,7 +289,7 @@ def test_series_modals_split_information_suits_and_periods(tmp_path: Path) -> No
     assert [item.label for item in periods.children] == ["檔期"]
 
 
-def test_series_contents_and_images_use_the_same_suit_records(tmp_path: Path) -> None:
+def test_series_contents_use_the_same_suit_records(tmp_path: Path) -> None:
     database_path = tmp_path / "series-shared-suits.db"
     seed_series(database_path)
     repository = KnowledgeQueryRepository(database_path)
@@ -297,31 +297,10 @@ def test_series_contents_and_images_use_the_same_suit_records(tmp_path: Path) ->
     assert series is not None
 
     repository.save_series_contents(series.id, main=["幻夜女王"], minor=[], live2d=[])
-    connection = get_connection(database_path)
-    try:
-        raw_post_id = connection.execute(
-            """
-            INSERT INTO raw_posts (source, source_post_id, url, content, scraped_at, updated_at)
-            VALUES ('test', 'shared-image', 'https://example.test/shared', 'image', 'x', 'x')
-            """
-        ).lastrowid
-        raw_image_id = connection.execute(
-            """
-            INSERT INTO raw_post_images (raw_post_id, image_url, position, created_at)
-            VALUES (?, 'https://images.example.test/queen.jpg', 0, 'x')
-            """,
-            (raw_post_id,),
-        ).lastrowid
-        connection.commit()
-    finally:
-        connection.close()
-
-    repository.save_series_images(series.id, ["https://images.example.test/queen.jpg"])
     suit = repository.get_suit_by_name("幻夜女王")
     assert suit is not None
     assert suit.series_names == ["永夜國之夢"]
-    assert repository.get_display_image_for_suit(suit.id) == "https://images.example.test/queen.jpg"
-    assert repository.get_primary_image_for_series(series.id) == "https://images.example.test/queen.jpg"
+    assert repository.get_display_image_for_suit(suit.id) is None
     suit_embed = create_suit_embed(suit)
     assert "🏛️ 所屬系列：永夜國之夢" in suit_embed.description
     assert "🏷️ 活動分類：故事套裝" in suit_embed.description
@@ -330,13 +309,13 @@ def test_series_contents_and_images_use_the_same_suit_records(tmp_path: Path) ->
     try:
         assert connection.execute("SELECT COUNT(*) FROM suits WHERE name = '幻夜女王'").fetchone()[0] == 1
         assert connection.execute(
-            "SELECT raw_post_image_id FROM suit_images WHERE suit_id = ?", (suit.id,)
-        ).fetchone()[0] == raw_image_id
+            "SELECT COUNT(*) FROM suit_images WHERE suit_id = ?", (suit.id,)
+        ).fetchone()[0] == 0
     finally:
         connection.close()
 
 
-def test_suit_owned_images_update_the_bound_series_event_without_raw_post(tmp_path: Path) -> None:
+def test_suit_owned_images_do_not_change_the_bound_series_event_card_source(tmp_path: Path) -> None:
     database_path = tmp_path / "series-suit-images.db"
     seed_series(database_path)
     repository = KnowledgeQueryRepository(database_path)
@@ -352,7 +331,7 @@ def test_suit_owned_images_update_the_bound_series_event_without_raw_post(tmp_pa
         event_id = int(connection.execute("SELECT event_id FROM series WHERE id = ?", (series.id,)).fetchone()[0])
     finally:
         connection.close()
-    assert repository.get_primary_image_for_event(event_id) == "https://images.example.test/manual-queen.jpg"
+    assert repository.get_announcement_image_for_event_id(event_id) is None
     assert repository.get_display_image_for_suit(suit.id) == "https://images.example.test/manual-queen.jpg"
     assert repository.get_suit_edit_context(suit.id).events[0].id == event_id
 
