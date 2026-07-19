@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +17,7 @@ class EventPeriodView:
     period_type: str
     start_at: str | None
     end_at: str | None
+    notes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class EventSuitView:
     acquisition_method: str | None
     cost_text: str | None
     appearance_status: str = "unknown"
+    content_type: str = "main"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +46,9 @@ class EventView:
     event_total_cost: str | None
     live2d_cost: str | None
     data_status: str = "auto"
+    entity_type: str = "event"
+    series_periods: list[str] = field(default_factory=list)
+    series_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +83,7 @@ class SuitView:
     description: str | None
     events: list[SuitEventView]
     data_status: str = "auto"
+    series_names: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +140,20 @@ class EventEditContext:
     event_type_id: int | None
     event_type_name: str | None
     is_visible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesEditContext:
+    """Editable fixed-series fields presented through the administrator card."""
+
+    series_id: int
+    event_id: int | None
+    name: str
+    category: str
+    diamond_cost: str | None
+    notes: str | None
+    contents: list[tuple[str, str]]
+    periods: list[str]
 
 
 class KnowledgeQueryRepository:
@@ -224,6 +244,100 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
+    def get_activity_by_reference(self, reference: str) -> EventView | None:
+        """Resolve a command/autocomplete reference without branching in the command."""
+        if reference.startswith("series:"):
+            raw_id = reference.removeprefix("series:")
+            if not raw_id.isdecimal():
+                return None
+            context = self.get_series_edit_context(int(raw_id))
+            return self.get_event_by_id(context.event_id) if context and context.event_id else None
+        if reference.isdecimal():
+            return self.get_queryable_event_by_id(int(reference))
+        matches = self.get_activities_by_name(reference)
+        return matches[0] if len(matches) == 1 else None
+
+    def get_activities_by_name(self, name: str) -> list[EventView]:
+        """Prefer the canonical fixed series over an equally named parsed event."""
+        series = self.get_series_edit_context_by_name(name)
+        if series is not None and series.event_id is not None:
+            event = self.get_event_by_id(series.event_id)
+            return [event] if event is not None else []
+        return self.get_events_by_name(name)
+
+    def get_series_by_id(self, series_id: int) -> EventView | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT id, name, category, notes, diamond_cost
+                FROM series WHERE id = ? AND is_active = 1
+                """,
+                (series_id,),
+            ).fetchone()
+            return self._build_series_view(connection, row) if row is not None else None
+        finally:
+            connection.close()
+
+    def get_series_by_name(self, name: str) -> EventView | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT id, name, category, notes, diamond_cost
+                FROM series WHERE name = ? AND is_active = 1
+                """,
+                (name.strip(),),
+            ).fetchone()
+            return self._build_series_view(connection, row) if row is not None else None
+        finally:
+            connection.close()
+
+    def search_activity_options(
+        self, query: str, limit: int = 5
+    ) -> list[tuple[str, str, str | None]]:
+        """Return fixed series first, suppressing equally named parsed events."""
+        connection = self._connect()
+        try:
+            pattern = f"%{query.strip()}%"
+            series_rows = connection.execute(
+                """
+                SELECT id, name FROM series
+                WHERE name LIKE ? AND is_active = 1
+                ORDER BY display_order, name LIMIT ?
+                """,
+                (pattern, limit),
+            ).fetchall()
+            series_names = {str(row[1]) for row in series_rows}
+            options = []
+            for series_id, series_name in series_rows:
+                context = self.get_series_edit_context(int(series_id))
+                if context is not None and context.event_id is not None:
+                    options.append((str(context.event_id), str(series_name), None))
+            remaining = max(limit - len(options), 0)
+            if remaining:
+                event_rows = connection.execute(
+                    """
+                    SELECT e.id, e.name,
+                           (SELECT start_at FROM event_periods WHERE event_id = e.id
+                            ORDER BY start_at IS NULL, start_at DESC, id DESC LIMIT 1)
+                    FROM events AS e
+                    WHERE e.name LIKE ?
+                      AND e.content_type IN ('event', 'suit_event')
+                      AND e.is_visible = 1
+                    ORDER BY e.name, e.id DESC LIMIT ?
+                    """,
+                    (pattern, limit),
+                ).fetchall()
+                options.extend(
+                    (str(event_id), str(name), str(start_at) if start_at else None)
+                    for event_id, name, start_at in event_rows
+                    if str(name) not in series_names
+                )
+            return options[:limit]
+        finally:
+            connection.close()
+
     def get_event_edit_context(self, event_id: int) -> EventEditContext | None:
         """Read one event and its most recent period for the management UI."""
         connection = self._connect()
@@ -251,6 +365,240 @@ class KnowledgeQueryRepository:
                 event_type_id=int(row[6]) if row[6] is not None else None,
                 event_type_name=row[7], is_visible=bool(row[8]), start_at=row[9], end_at=row[10],
             )
+        finally:
+            connection.close()
+
+    def get_series_edit_context(self, series_id: int) -> SeriesEditContext | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT id, event_id, name, category, diamond_cost, notes FROM series WHERE id = ?",
+                (series_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            contents = connection.execute(
+                """
+                SELECT suits.name, series_contents.type
+                FROM series_contents
+                JOIN suits ON suits.id = series_contents.suit_id
+                WHERE series_contents.series_id = ?
+                ORDER BY CASE series_contents.type
+                    WHEN 'main' THEN 0
+                    WHEN 'minor' THEN 1
+                    WHEN 'live2d' THEN 2
+                    WHEN 'frame' THEN 3
+                    ELSE 4
+                END, series_contents.display_order, series_contents.id
+                """,
+                (series_id,),
+            ).fetchall()
+            periods = connection.execute(
+                """
+                SELECT label FROM series_periods
+                WHERE series_id = ? ORDER BY display_order, id
+                """,
+                (series_id,),
+            ).fetchall()
+            return SeriesEditContext(
+                series_id=int(row[0]), event_id=int(row[1]) if row[1] is not None else None,
+                name=str(row[2]), category=str(row[3]),
+                diamond_cost=str(row[4]) if row[4] else None, notes=row[5],
+                contents=[(str(name), str(content_type)) for name, content_type in contents],
+                periods=[str(label) for (label,) in periods],
+            )
+        finally:
+            connection.close()
+
+    def get_series_edit_context_by_name(self, name: str) -> SeriesEditContext | None:
+        connection = self._connect()
+        try:
+            row = connection.execute("SELECT id FROM series WHERE name = ?", (name.strip(),)).fetchone()
+            return self.get_series_edit_context(int(row[0])) if row is not None else None
+        finally:
+            connection.close()
+
+    def get_series_edit_context_for_event(self, event_id: int) -> SeriesEditContext | None:
+        connection = self._connect()
+        try:
+            row = connection.execute("SELECT id FROM series WHERE event_id = ?", (event_id,)).fetchone()
+            return self.get_series_edit_context(int(row[0])) if row is not None else None
+        finally:
+            connection.close()
+
+    def save_series_info(
+        self,
+        series_id: int,
+        *,
+        name: str,
+        category: str,
+        diamond_cost: str | None,
+        notes: str | None,
+    ) -> None:
+        normalized_name, normalized_category = name.strip(), category.strip()
+        if not normalized_name:
+            raise ValueError("系列名稱不可為空白。")
+        normalized_cost = (diamond_cost or "").strip()
+        if normalized_cost and not normalized_cost.isdecimal():
+            raise ValueError("鑽石花費必須是純整數。")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            now = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                """
+                UPDATE series
+                SET name = ?, category = ?, diamond_cost = ?, notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized_name, normalized_category, normalized_cost or None, notes.strip() or None, now, series_id),
+            )
+            self._sync_series_event(connection, series_id, now)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def save_series_contents(
+        self,
+        series_id: int,
+        *,
+        main: list[str],
+        minor: list[str],
+        live2d: list[str],
+    ) -> None:
+        """Replace only editable types, preserving existing frame and other content."""
+        values_by_type = {
+            content_type: list(dict.fromkeys(value.strip() for value in values if value.strip()))
+            for content_type, values in (("main", main), ("minor", minor), ("live2d", live2d))
+        }
+        seen: set[str] = set()
+        for content_type in ("main", "minor", "live2d"):
+            for name in values_by_type[content_type]:
+                if name in seen:
+                    raise ValueError("同一套裝不可同時存在於多個類型。")
+                seen.add(name)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            protected_names = {
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT suits.name FROM series_contents
+                    JOIN suits ON suits.id = series_contents.suit_id
+                    WHERE series_contents.series_id = ? AND series_contents.type IN ('frame', 'other')
+                    """,
+                    (series_id,),
+                ).fetchall()
+            }
+            if conflicts := protected_names & seen:
+                raise ValueError(f"套裝已保留為 frame 或 other：{sorted(conflicts)[0]}")
+            now = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                "DELETE FROM series_contents WHERE series_id = ? AND type IN ('main', 'minor', 'live2d')",
+                (series_id,),
+            )
+            rows = [
+                (series_id, self._get_or_create_suit_id(connection, name, content_type == "live2d", now), content_type, index, now, now)
+                for content_type in ("main", "minor", "live2d")
+                for index, name in enumerate(values_by_type[content_type])
+            ]
+            connection.executemany(
+                """
+                INSERT INTO series_contents (
+                    series_id, suit_id, type, display_order, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?)
+                """,
+                rows,
+            )
+            connection.execute("UPDATE series SET updated_at = ? WHERE id = ?", (now, series_id))
+            self._sync_series_event(connection, series_id, now)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _get_or_create_suit_id(
+        connection: sqlite3.Connection, name: str, is_live2d: bool, now: str
+    ) -> int:
+        connection.execute(
+            """
+            INSERT INTO suits (name, is_live2d, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO NOTHING
+            """,
+            (name, int(is_live2d), now, now),
+        )
+        suit_id = int(connection.execute("SELECT id FROM suits WHERE name = ?", (name,)).fetchone()[0])
+        if is_live2d:
+            connection.execute("UPDATE suits SET is_live2d = 1, updated_at = ? WHERE id = ?", (now, suit_id))
+        return suit_id
+
+    @staticmethod
+    def _sync_series_event(connection: sqlite3.Connection, series_id: int, now: str) -> int:
+        """Mirror a fixed Series into its canonical Event/EventSuit graph."""
+        from database.database import _sync_series_event_children
+
+        series = connection.execute(
+            "SELECT name, category, notes, diamond_cost, event_id FROM series WHERE id = ?", (series_id,)
+        ).fetchone()
+        if series is None:
+            raise ValueError("找不到固定系列資料。")
+        name, category, notes, diamond_cost, event_id = series
+        event_type_id = None
+        if category:
+            existing_type = connection.execute("SELECT id FROM event_types WHERE name = ?", (category,)).fetchone()
+            event_type_id = int(existing_type[0]) if existing_type else int(
+                connection.execute("INSERT INTO event_types (name, is_active) VALUES (?, 1)", (category,)).lastrowid
+            )
+        if event_id is None:
+            event_id = int(connection.execute(
+                """
+                INSERT INTO events (name, official_series, event_type_id, description, created_at, updated_at,
+                    content_type, is_visible, data_status, created_via, updated_via)
+                VALUES (?, ?, ?, ?, ?, ?, 'event', 1, 'verified', 'series', 'series')
+                """,
+                (name, name, event_type_id, notes, now, now),
+            ).lastrowid)
+            connection.execute("UPDATE series SET event_id = ? WHERE id = ?", (event_id, series_id))
+        else:
+            connection.execute(
+                """
+                UPDATE events SET name = ?, official_series = ?, event_type_id = ?, description = ?,
+                    updated_at = ?, updated_via = 'series' WHERE id = ?
+                """,
+                (name, name, event_type_id, notes, now, event_id),
+            )
+        _sync_series_event_children(connection, series_id, int(event_id), diamond_cost, now)
+        return int(event_id)
+
+    def save_series_periods(self, series_id: int, labels: list[str]) -> None:
+        """Replace one Series's ordered display-only period labels."""
+        normalized = list(dict.fromkeys(label.strip() for label in labels if label.strip()))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            now = datetime.now(timezone.utc).isoformat()
+            connection.execute("DELETE FROM series_periods WHERE series_id = ?", (series_id,))
+            connection.executemany(
+                """
+                INSERT INTO series_periods (series_id, label, display_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(series_id, label, index, now, now) for index, label in enumerate(normalized)],
+            )
+            connection.execute("UPDATE series SET updated_at = ? WHERE id = ?", (now, series_id))
+            self._sync_series_event(connection, series_id, now)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -635,21 +983,6 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
-    def mark_event_verified(self, event_id: int) -> None:
-        """Confirm an event and its current periods/relationships without changing content."""
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN")
-            connection.execute("UPDATE events SET data_status = 'verified', updated_via = 'admin' WHERE id = ?", (event_id,))
-            connection.execute("UPDATE event_periods SET data_status = 'verified', updated_via = 'admin' WHERE event_id = ?", (event_id,))
-            connection.execute("UPDATE event_suits SET data_status = 'verified', updated_via = 'admin' WHERE event_id = ?", (event_id,))
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
     def _update_event_field(self, event_id: int, field_name: str, value: object) -> None:
         if field_name not in {"event_type_id"}:
             raise ValueError("Unsupported event field.")
@@ -755,6 +1088,16 @@ class KnowledgeQueryRepository:
                         appearance_status=str(appearance_status or "unknown"),
                     )
                 )
+            series_rows = connection.execute(
+                """
+                SELECT series.name
+                FROM event_suits
+                JOIN series ON series.event_id = event_suits.event_id
+                WHERE event_suits.suit_id = ? AND series.is_active = 1
+                ORDER BY series.display_order, series.name
+                """,
+                (suit_id,),
+            ).fetchall()
             return SuitView(
                 id=int(suit_id),
                 name=str(suit_name),
@@ -763,6 +1106,7 @@ class KnowledgeQueryRepository:
                 description=description,
                 events=events,
                 data_status=str(data_status),
+                series_names=[str(series_name) for (series_name,) in series_rows],
             )
         finally:
             connection.close()
@@ -880,9 +1224,9 @@ class KnowledgeQueryRepository:
             try:
                 row = connection.execute(
                     """
-                    SELECT raw_post_images.image_url
+                    SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
                     FROM suit_images
-                    JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
+                    LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
                     WHERE suit_images.suit_id = ? AND suit_images.is_primary = 1
                     ORDER BY suit_images.display_order, suit_images.id
                     LIMIT 1
@@ -895,44 +1239,80 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
-    def get_display_image_for_suit(self, suit_id: int) -> str | None:
-        """Use an explicit suit image, or a safe one-suit activity fallback."""
-        primary_image = self.get_primary_image_for_suit(suit_id)
-        if primary_image:
-            return primary_image
-
+    def get_primary_image_for_series(self, series_id: int) -> str | None:
+        """Return the first shared suit image in a Series's display order."""
         connection = self._connect()
         try:
-            try:
-                rows = connection.execute(
-                    """
-                    SELECT e.name
-                    FROM event_suits AS es
-                    JOIN events AS e ON e.id = es.event_id
-                    WHERE es.suit_id = ?
-                      AND (
-                          SELECT COUNT(*)
-                          FROM event_suits AS event_suit_count
-                          WHERE event_suit_count.event_id = es.event_id
-                      ) = 1
-                    ORDER BY (
-                        SELECT MAX(event_periods.start_at)
-                        FROM event_periods
-                        WHERE event_periods.event_id = e.id
-                    ) DESC, e.updated_at DESC
-                    """,
-                    (suit_id,),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                return None
+            row = connection.execute(
+                """
+                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
+                FROM series_contents
+                JOIN suit_images ON suit_images.suit_id = series_contents.suit_id
+                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
+                WHERE series_contents.series_id = ?
+                ORDER BY CASE series_contents.type
+                    WHEN 'main' THEN 0
+                    WHEN 'live2d' THEN 1
+                    WHEN 'minor' THEN 2
+                    ELSE 3
+                END, series_contents.display_order, suit_images.is_primary DESC,
+                suit_images.display_order, suit_images.id
+                LIMIT 1
+                """,
+                (series_id,),
+            ).fetchone()
+            return str(row[0]) if row and row[0] else None
         finally:
             connection.close()
 
-        for (event_name,) in rows:
-            image_url = self.get_announcement_image_for_event(str(event_name))
-            if image_url:
-                return image_url
-        return None
+    def get_primary_image_for_event(self, event_id: int) -> str | None:
+        """Read card media solely through EventSuit and SuitImages."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
+                FROM event_suits
+                JOIN suit_images ON suit_images.suit_id = event_suits.suit_id
+                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
+                WHERE event_suits.event_id = ?
+                ORDER BY event_suits.display_order, suit_images.is_primary DESC,
+                    suit_images.display_order, suit_images.id
+                LIMIT 1
+                """,
+                (event_id,),
+            ).fetchone()
+            return str(row[0]) if row and row[0] else None
+        finally:
+            connection.close()
+
+    def get_series_image_urls(self, series_id: int) -> list[str]:
+        """List shared suit-image URLs once, in Series display order."""
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
+                FROM series_contents
+                JOIN suit_images ON suit_images.suit_id = series_contents.suit_id
+                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
+                WHERE series_contents.series_id = ?
+                ORDER BY CASE series_contents.type
+                    WHEN 'main' THEN 0
+                    WHEN 'live2d' THEN 1
+                    WHEN 'minor' THEN 2
+                    ELSE 3
+                END, series_contents.display_order, suit_images.display_order, suit_images.id
+                """,
+                (series_id,),
+            ).fetchall()
+            return list(dict.fromkeys(str(url) for (url,) in rows if url))
+        finally:
+            connection.close()
+
+    def get_display_image_for_suit(self, suit_id: int) -> str | None:
+        """Return the Suit-owned image without inferring one from raw posts."""
+        return self.get_primary_image_for_suit(suit_id)
 
     def get_raw_images_for_event(self, event_id: int) -> list[RawPostImageView]:
         """List stored announcement images for the event's source raw post."""
@@ -1002,6 +1382,92 @@ class KnowledgeQueryRepository:
             raise
         finally:
             connection.close()
+
+    def save_series_images(self, series_id: int, urls: list[str]) -> None:
+        """Replace the shared image list for every suit linked to one fixed Series."""
+        normalized_urls = list(dict.fromkeys(url.strip() for url in urls if url.strip()))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            suit_ids = [
+                int(suit_id)
+                for (suit_id,) in connection.execute(
+                    "SELECT suit_id FROM series_contents WHERE series_id = ? ORDER BY id",
+                    (series_id,),
+                ).fetchall()
+            ]
+            if normalized_urls and not suit_ids:
+                raise ValueError("請先建立至少一個套裝，再設定共用圖片。")
+            for suit_id in suit_ids:
+                self._replace_suit_images(connection, suit_id, normalized_urls)
+            connection.execute(
+                "UPDATE series SET updated_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), series_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_suit_image_urls(self, suit_id: int) -> list[str]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT COALESCE(raw_post_images.image_url, suit_images.image_url)
+                FROM suit_images
+                LEFT JOIN raw_post_images ON raw_post_images.id = suit_images.raw_post_image_id
+                WHERE suit_images.suit_id = ?
+                ORDER BY suit_images.display_order, suit_images.id
+                """,
+                (suit_id,),
+            ).fetchall()
+            return [str(url) for (url,) in rows if url]
+        finally:
+            connection.close()
+
+    def save_suit_images(self, suit_id: int, urls: list[str]) -> None:
+        """Replace one Suit's image list without requiring a raw announcement."""
+        normalized_urls = list(dict.fromkeys(url.strip() for url in urls if url.strip()))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            self._replace_suit_images(connection, suit_id, normalized_urls)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _replace_suit_images(
+        connection: sqlite3.Connection, suit_id: int, urls: list[str]
+    ) -> None:
+        """Store one canonical image relation per URL, reusing raw media where known."""
+        connection.execute("DELETE FROM suit_images WHERE suit_id = ?", (suit_id,))
+        for position, url in enumerate(urls):
+            raw_image = connection.execute(
+                "SELECT id FROM raw_post_images WHERE image_url = ? ORDER BY id LIMIT 1", (url,)
+            ).fetchone()
+            if raw_image is not None:
+                connection.execute(
+                    """
+                    INSERT INTO suit_images (suit_id, raw_post_image_id, image_url, display_order, is_primary)
+                    VALUES (?, ?, NULL, ?, ?)
+                    """,
+                    (suit_id, int(raw_image[0]), position, int(position == 0)),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO suit_images (suit_id, raw_post_image_id, image_url, display_order, is_primary)
+                    VALUES (?, NULL, ?, ?, ?)
+                    """,
+                    (suit_id, url, position, int(position == 0)),
+                )
 
     def get_suit_edit_context(self, suit_id: int) -> SuitEditContext | None:
         """Return a suit and its event-specific values for the Discord edit UI."""
@@ -1157,20 +1623,6 @@ class KnowledgeQueryRepository:
         finally:
             connection.close()
 
-    def mark_suit_verified(self, suit_id: int) -> None:
-        """Confirm a suit and its event relations from the suit management card."""
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN")
-            connection.execute("UPDATE suits SET data_status = 'verified', updated_via = 'discord_admin' WHERE id = ?", (suit_id,))
-            connection.execute("UPDATE event_suits SET data_status = 'verified', updated_via = 'discord_admin' WHERE suit_id = ?", (suit_id,))
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
     def _search_names(self, table: str, query: str, limit: int) -> list[str]:
         if table not in {"events", "suits"}:
             raise ValueError("Unsupported knowledge-base table.")
@@ -1190,7 +1642,7 @@ class KnowledgeQueryRepository:
         event_id, name, official_series, event_type, description, data_status = event_row
         period_rows = connection.execute(
             """
-            SELECT period_type, start_at, end_at
+            SELECT period_type, start_at, end_at, notes
             FROM event_periods
             WHERE event_id = ?
             ORDER BY start_at IS NULL, start_at ASC, id ASC
@@ -1199,7 +1651,7 @@ class KnowledgeQueryRepository:
         ).fetchall()
         suit_rows = connection.execute(
             """
-            SELECT s.name, s.is_live2d, am.name, cr.cost_text, es.appearance_status
+            SELECT s.name, s.is_live2d, am.name, cr.cost_text, es.appearance_status, es.content_type
             FROM event_suits AS es
             JOIN suits AS s ON s.id = es.suit_id
             LEFT JOIN acquisition_methods AS am ON am.id = es.acquisition_method_id
@@ -1223,6 +1675,7 @@ class KnowledgeQueryRepository:
                 (event_id,),
             ).fetchall()
         }
+        series_row = connection.execute("SELECT id FROM series WHERE event_id = ?", (event_id,)).fetchone()
         return EventView(
             id=int(event_id),
             name=str(name),
@@ -1237,10 +1690,66 @@ class KnowledgeQueryRepository:
                     acquisition_method=acquisition_method,
                     cost_text=cost_text,
                     appearance_status=str(appearance_status or "unknown"),
+                    content_type=str(content_type or "main"),
                 )
-                for suit_name, is_live2d, acquisition_method, cost_text, appearance_status in suit_rows
+                for suit_name, is_live2d, acquisition_method, cost_text, appearance_status, content_type in suit_rows
             ],
             event_total_cost=costs.get("event_total"),
             live2d_cost=costs.get("live2d"),
             data_status=str(data_status),
+            entity_type="series" if series_row else "event",
+            series_id=int(series_row[0]) if series_row else None,
+            series_periods=[str(period.notes) for period in [EventPeriodView(*row) for row in period_rows] if period.notes]
+            if series_row else [],
+        )
+
+    def _build_series_view(
+        self, connection: sqlite3.Connection, row: tuple[object, ...]
+    ) -> EventView:
+        series_id, name, category, notes, diamond_cost = row
+        content_rows = connection.execute(
+            """
+            SELECT suits.name, series_contents.type
+            FROM series_contents
+            JOIN suits ON suits.id = series_contents.suit_id
+            WHERE series_contents.series_id = ?
+            ORDER BY CASE series_contents.type
+                WHEN 'main' THEN 0
+                WHEN 'minor' THEN 1
+                WHEN 'live2d' THEN 2
+                WHEN 'frame' THEN 3
+                ELSE 4
+            END, series_contents.display_order, series_contents.id
+            """,
+            (series_id,),
+        ).fetchall()
+        period_rows = connection.execute(
+            """
+            SELECT label FROM series_periods
+            WHERE series_id = ? ORDER BY display_order, id
+            """,
+            (series_id,),
+        ).fetchall()
+        return EventView(
+            id=int(series_id),
+            name=str(name),
+            official_series=None,
+            event_type=str(category),
+            description=notes,
+            periods=[],
+            suits=[
+                EventSuitView(
+                    name=str(content_name),
+                    is_live2d=str(content_type) == "live2d",
+                    acquisition_method=None,
+                    cost_text=None,
+                    content_type=str(content_type),
+                )
+                for content_name, content_type in content_rows
+            ],
+            event_total_cost=str(diamond_cost) if diamond_cost else None,
+            live2d_cost=None,
+            data_status="verified",
+            entity_type="series",
+            series_periods=[str(label) for (label,) in period_rows],
         )

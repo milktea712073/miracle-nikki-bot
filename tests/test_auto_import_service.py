@@ -4,8 +4,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from crawler.models import Post
-from bot.main import add_auto_status_notice
-import discord
 from database.auto_import_service import auto_import_parse_draft
 from database.database import get_connection
 from database.knowledge_query_repository import KnowledgeQueryRepository
@@ -241,14 +239,3 @@ def test_admin_suit_edit_marks_auto_data_verified(tmp_path: Path) -> None:
         ).fetchone()[0] == "verified"
     finally:
         connection.close()
-
-
-def test_auto_status_notice_is_only_visible_to_administrators() -> None:
-    admin_embed = discord.Embed()
-    player_embed = discord.Embed()
-
-    add_auto_status_notice(admin_embed, "auto", True)
-    add_auto_status_notice(player_embed, "auto", False)
-
-    assert admin_embed.footer.text == "自動建立，尚未確認"
-    assert player_embed.footer.text is None

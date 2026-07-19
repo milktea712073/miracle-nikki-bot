@@ -89,7 +89,7 @@ def test_only_administrators_receive_event_management_buttons() -> None:
     admin_view = create_event_response_view(1, "活動", True)
     assert isinstance(admin_view, EventAdminView)
     assert create_event_response_view(1, "活動", False) is None
-    assert {child.label for child in admin_view.children} == {"✏️ 編輯", "✅ 標記已確認"}
+    assert {child.label for child in admin_view.children} == {"✏️ 編輯"}
 
 
 class ModalResponse:

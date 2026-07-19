@@ -21,6 +21,7 @@ SCRIPT_MODULES = (
     "scripts.data.repair_facebook_post_aliases",
     "scripts.data.repair_joybomb_long_event_names",
     "scripts.data.repair_pending_draft_suits",
+    "scripts.data.seed_fixed_series",
     "scripts.announcement.initialize_announcement_queue",
     "scripts.announcement.baseline_announcements",
     "scripts.announcement.migrations.migrate_announcement_baseline",

@@ -7,7 +7,8 @@ from bot.admin.knowledge_suit_views import (
     ReturnSuitCardView,
     SuitRelationSelectView,
     SuitAdminView,
-    SuitImageEventSelectView,
+    SuitImageManagementView,
+    create_suit_image_embed,
 )
 from bot.main import (
     create_event_embed,
@@ -168,7 +169,7 @@ def test_free_suit_does_not_show_unorganized_cost(tmp_path):
     assert "尚未整理" not in embed.description
 
 
-def test_single_suit_activity_uses_related_announcement_image_as_fallback(tmp_path):
+def test_single_suit_activity_does_not_infer_images_from_related_raw_posts(tmp_path):
     database_path = tmp_path / "image.db"
     seed_suit(database_path, image_url="https://example.test/announcement.jpg")
     repository = KnowledgeQueryRepository(database_path)
@@ -178,7 +179,7 @@ def test_single_suit_activity_uses_related_announcement_image_as_fallback(tmp_pa
     image_url = repository.get_display_image_for_suit(suit.id)
     embed = create_suit_embed(suit, image_url)
 
-    assert embed.image.url == "https://example.test/announcement.jpg"
+    assert embed.image.url is None
 
 
 def test_suit_card_without_image_is_valid(tmp_path):
@@ -266,7 +267,7 @@ def test_administrator_suit_response_has_management_buttons():
 
     assert isinstance(view, SuitAdminView)
     assert view.suit_id == 42
-    assert {item.label for item in view.children} == {"✏️ 編輯套裝", "🖼️ 編輯圖片", "✅ 標記已確認"}
+    assert {item.label for item in view.children} == {"✏️ 編輯套裝", "🖼️ 編輯圖片"}
 
 
 def test_multi_event_relation_selector_contains_only_the_relation_choice(tmp_path):
@@ -397,17 +398,25 @@ def test_image_preview_marks_an_invalid_url_without_raising():
     assert any(field.value == "此圖片目前無法預覽。" for field in embed.fields)
 
 
-def test_multi_activity_image_flow_starts_with_an_event_selector(tmp_path):
+def test_suit_image_management_uses_suit_owned_pages_not_event_sources(tmp_path):
     database_path = tmp_path / "multi-event-selector.db"
     seed_suit(database_path, image_url="https://example.test/source.jpg")
     repository = KnowledgeQueryRepository(database_path)
-    context = repository.get_suit_edit_context(1)
-    assert context is not None
+    suit = repository.get_suit_by_name("山")
+    assert suit is not None
+    repository.save_suit_images(suit.id, ["https://example.test/one.jpg", "https://example.test/two.jpg"])
+    view = SuitImageManagementView(
+        suit.id, suit.name, repository.get_suit_image_urls(suit.id), owner_user_id=1, public_message=None
+    )
 
-    view = SuitImageEventSelectView(1, context.suit_name, context.events * 2, owner_user_id=1)
-
-    assert len(view.children) == 1
-    assert view.children[0].placeholder == "選擇圖片來源活動"
+    assert "圖片：【1 / 2】" in view.embed().description
+    assert view.previous.disabled is True
+    assert view.next.disabled is False
+    view.index = 1
+    view._update_navigation()
+    assert "圖片：【2 / 2】" in view.embed().description
+    assert view.next.disabled is True
+    assert create_suit_image_embed(suit.name, [], 0).description.endswith("圖片：【0 / 0】")
 
 
 @pytest.mark.parametrize(

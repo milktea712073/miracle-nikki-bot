@@ -454,11 +454,13 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS suit_images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             suit_id INTEGER NOT NULL,
-            raw_post_image_id INTEGER NOT NULL,
+            raw_post_image_id INTEGER,
+            image_url TEXT,
             display_order INTEGER NOT NULL DEFAULT 0,
             is_primary INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (suit_id) REFERENCES suits(id) ON DELETE CASCADE,
             FOREIGN KEY (raw_post_image_id) REFERENCES raw_post_images(id) ON DELETE CASCADE,
+            CHECK (raw_post_image_id IS NOT NULL OR image_url IS NOT NULL),
             UNIQUE(suit_id, raw_post_image_id)
         );
 
@@ -466,13 +468,65 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
             ON suit_images(suit_id) WHERE is_primary = 1;
         CREATE INDEX IF NOT EXISTS idx_suit_images_suit_id
             ON suit_images(suit_id);
+
+        CREATE TABLE IF NOT EXISTS series (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            category TEXT NOT NULL,
+            display_order INTEGER NOT NULL DEFAULT 0,
+            notes TEXT,
+            diamond_cost TEXT,
+            event_id INTEGER UNIQUE,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS series_contents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            series_id INTEGER NOT NULL,
+            suit_id INTEGER NOT NULL,
+            type TEXT NOT NULL CHECK (type IN ('main', 'live2d', 'minor', 'frame', 'other')),
+            display_order INTEGER NOT NULL DEFAULT 0,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+            FOREIGN KEY (suit_id) REFERENCES suits(id) ON DELETE CASCADE,
+            UNIQUE(series_id, suit_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_series_name ON series(name);
+        CREATE INDEX IF NOT EXISTS idx_series_contents_order
+            ON series_contents(series_id, display_order, id);
+
+        CREATE TABLE IF NOT EXISTS series_periods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            series_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            display_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+            UNIQUE(series_id, label)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_series_periods_order
+            ON series_periods(series_id, display_order, id);
         """
     )
+    _migrate_suit_images_to_shared_urls(connection)
+    _migrate_series_contents_to_suit_links(connection)
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_suit_images_manual_url "
+        "ON suit_images(suit_id, image_url) WHERE image_url IS NOT NULL"
+    )
     _initialize_knowledge_provenance_columns(connection)
+    _synchronize_existing_series_events(connection)
     # Earlier databases used ``events.name`` as a unique key.  Activity names are
     # display data, however: separate official posts can legitimately have the
     # same name.  Preserve all rows while removing that legacy uniqueness rule.
-    connection.commit()
     _migrate_events_name_unique_constraint(connection)
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_source_raw_post_id "
@@ -489,6 +543,214 @@ def initialize_knowledge_base_tables(connection: sqlite3.Connection) -> None:
         "AND source_splitter_version IS NOT NULL"
     )
     connection.commit()
+
+
+def _synchronize_existing_series_events(connection: sqlite3.Connection) -> None:
+    """Backfill one standard Event graph for each fixed Series without raw-post data."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = connection.execute(
+        "SELECT id, name, category, notes, diamond_cost, event_id FROM series ORDER BY id"
+    ).fetchall()
+    for series_id, name, category, notes, diamond_cost, event_id in rows:
+        type_id = None
+        if category:
+            row = connection.execute("SELECT id FROM event_types WHERE name = ?", (category,)).fetchone()
+            type_id = int(row[0]) if row else int(
+                connection.execute("INSERT INTO event_types (name, is_active) VALUES (?, 1)", (category,)).lastrowid
+            )
+        event_row = connection.execute("SELECT id FROM events WHERE id = ?", (event_id,)).fetchone() if event_id else None
+        if event_row is None:
+            event_id = int(connection.execute(
+                """
+                INSERT INTO events (name, official_series, event_type_id, description, created_at, updated_at,
+                    content_type, is_visible, data_status, created_via, updated_via)
+                VALUES (?, ?, ?, ?, ?, ?, 'event', 1, 'verified', 'series', 'series')
+                """,
+                (name, name, type_id, notes, now, now),
+            ).lastrowid)
+            connection.execute("UPDATE series SET event_id = ? WHERE id = ?", (event_id, series_id))
+        else:
+            connection.execute(
+                """
+                UPDATE events
+                SET name = ?, official_series = ?, event_type_id = ?, description = ?,
+                    updated_at = ?, updated_via = 'series'
+                WHERE id = ?
+                """,
+                (name, name, type_id, notes, now, event_id),
+            )
+        _sync_series_event_children(connection, int(series_id), int(event_id), diamond_cost, now)
+
+
+def _sync_series_event_children(
+    connection: sqlite3.Connection, series_id: int, event_id: int, diamond_cost: object, now: str
+) -> None:
+    """Mirror Series maintenance records into the Event graph used by Discord."""
+    connection.execute("DELETE FROM event_suits WHERE event_id = ?", (event_id,))
+    content_rows = connection.execute(
+        "SELECT suit_id, type, display_order FROM series_contents WHERE series_id = ? ORDER BY display_order, id",
+        (series_id,),
+    ).fetchall()
+    for suit_id, content_type, display_order in content_rows:
+        connection.execute(
+            """
+            INSERT INTO event_suits (event_id, suit_id, display_order, content_type, appearance_status,
+                data_status, updated_via)
+            VALUES (?, ?, ?, ?, 'unknown', 'verified', 'series')
+            """,
+            (event_id, suit_id, display_order, content_type),
+        )
+    connection.execute("DELETE FROM event_periods WHERE event_id = ?", (event_id,))
+    for position, (label,) in enumerate(connection.execute(
+        "SELECT label FROM series_periods WHERE series_id = ? ORDER BY display_order, id", (series_id,)
+    )):
+        connection.execute(
+            """
+            INSERT INTO event_periods (event_id, period_type, notes, created_at, data_status, updated_via)
+            VALUES (?, 'unknown', ?, ?, 'verified', 'series')
+            """,
+            (event_id, label, now),
+        )
+    existing = connection.execute(
+        "SELECT id FROM cost_records WHERE event_id = ? AND suit_id IS NULL AND cost_scope = 'event_total'", (event_id,)
+    ).fetchone()
+    if diamond_cost:
+        if existing:
+            connection.execute("UPDATE cost_records SET cost_text = ? WHERE id = ?", (diamond_cost, existing[0]))
+        else:
+            connection.execute(
+                "INSERT INTO cost_records (event_id, suit_id, cost_scope, cost_text) VALUES (?, NULL, 'event_total', ?)",
+                (event_id, diamond_cost),
+            )
+    elif existing:
+        connection.execute("DELETE FROM cost_records WHERE id = ?", (existing[0],))
+
+
+def _migrate_suit_images_to_shared_urls(connection: sqlite3.Connection) -> None:
+    """Allow suit images to reference raw media or one administrator-entered URL."""
+    columns = {
+        str(row[1]): bool(row[3])
+        for row in connection.execute("PRAGMA table_info(suit_images)").fetchall()
+    }
+    if "image_url" in columns and not columns.get("raw_post_image_id", False):
+        return
+    rows = connection.execute(
+        "SELECT id, suit_id, raw_post_image_id, display_order, is_primary FROM suit_images ORDER BY id"
+    ).fetchall()
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.executescript(
+            """
+            CREATE TABLE suit_images_rebuilt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suit_id INTEGER NOT NULL,
+                raw_post_image_id INTEGER,
+                image_url TEXT,
+                display_order INTEGER NOT NULL DEFAULT 0,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (suit_id) REFERENCES suits(id) ON DELETE CASCADE,
+                FOREIGN KEY (raw_post_image_id) REFERENCES raw_post_images(id) ON DELETE CASCADE,
+                CHECK (raw_post_image_id IS NOT NULL OR image_url IS NOT NULL),
+                UNIQUE(suit_id, raw_post_image_id)
+            );
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO suit_images_rebuilt (
+                id, suit_id, raw_post_image_id, image_url, display_order, is_primary
+            ) VALUES (?, ?, ?, NULL, ?, ?)
+            """,
+            rows,
+        )
+        connection.execute("DROP TABLE suit_images")
+        connection.execute("ALTER TABLE suit_images_rebuilt RENAME TO suit_images")
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_suit_images_one_primary "
+            "ON suit_images(suit_id) WHERE is_primary = 1"
+        )
+        connection.execute("CREATE INDEX idx_suit_images_suit_id ON suit_images(suit_id)")
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_suit_images_manual_url "
+            "ON suit_images(suit_id, image_url) WHERE image_url IS NOT NULL"
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_series_contents_to_suit_links(connection: sqlite3.Connection) -> None:
+    """Replace legacy Series content name snapshots with canonical suit links."""
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(series_contents)").fetchall()}
+    if "suit_id" in columns and "name" not in columns:
+        return
+    rows = connection.execute(
+        "SELECT id, series_id, name, type, display_order, notes, created_at, updated_at "
+        "FROM series_contents ORDER BY id"
+    ).fetchall()
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.executescript(
+            """
+            CREATE TABLE series_contents_rebuilt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id INTEGER NOT NULL,
+                suit_id INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('main', 'live2d', 'minor', 'frame', 'other')),
+                display_order INTEGER NOT NULL DEFAULT 0,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+                FOREIGN KEY (suit_id) REFERENCES suits(id) ON DELETE CASCADE,
+                UNIQUE(series_id, suit_id)
+            );
+            """
+        )
+        for row_id, series_id, name, content_type, display_order, notes, created_at, updated_at in rows:
+            connection.execute(
+                """
+                INSERT INTO suits (name, is_live2d, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO NOTHING
+                """,
+                (name, int(str(content_type) == "live2d"), created_at, updated_at),
+            )
+            suit_id = connection.execute("SELECT id FROM suits WHERE name = ?", (name,)).fetchone()[0]
+            if str(content_type) == "live2d":
+                connection.execute("UPDATE suits SET is_live2d = 1 WHERE id = ?", (suit_id,))
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO series_contents_rebuilt (
+                    id, series_id, suit_id, type, display_order, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (row_id, series_id, suit_id, content_type, display_order, notes, created_at, updated_at),
+            )
+        connection.execute("DROP TABLE series_contents")
+        connection.execute("ALTER TABLE series_contents_rebuilt RENAME TO series_contents")
+        connection.execute(
+            "CREATE INDEX idx_series_contents_order ON series_contents(series_id, display_order, id)"
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _column_exists(connection: sqlite3.Connection, table_name: str, column_name: str) -> bool:
@@ -518,6 +780,9 @@ def _initialize_knowledge_provenance_columns(connection: sqlite3.Connection) -> 
             ("created_via", "TEXT NOT NULL DEFAULT 'auto'"),
             ("updated_via", "TEXT NOT NULL DEFAULT 'auto'"),
         ),
+        "series": (
+            ("event_id", "INTEGER"),
+        ),
         "event_periods": (
             ("data_status", "TEXT NOT NULL DEFAULT 'auto'"),
             ("source_raw_post_id", "INTEGER"),
@@ -530,6 +795,7 @@ def _initialize_knowledge_provenance_columns(connection: sqlite3.Connection) -> 
             ("updated_via", "TEXT NOT NULL DEFAULT 'auto'"),
         ),
         "event_suits": (
+            ("content_type", "TEXT NOT NULL DEFAULT 'main'"),
             ("appearance_status", "TEXT NOT NULL DEFAULT 'unknown'"),
             ("data_status", "TEXT NOT NULL DEFAULT 'auto'"),
             ("source_raw_post_id", "INTEGER"),
@@ -554,6 +820,28 @@ def _migrate_events_name_unique_constraint(connection: sqlite3.Connection) -> No
     unique_name_index = _find_unique_name_index(connection, "events")
     if unique_name_index is None:
         return
+
+    def snapshot(table_name: str) -> tuple[list[str], list[tuple[object, ...]]]:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+        ).fetchone()
+        if exists is None:
+            return [], []
+        columns = [str(row[1]) for row in connection.execute(f"PRAGMA table_info({table_name})")]
+        return columns, connection.execute(f"SELECT * FROM {table_name}").fetchall()
+
+    dependent_rows = {
+        table_name: snapshot(table_name)
+        for table_name in ("event_periods", "event_suits", "cost_records")
+    }
+    has_series = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'series'"
+    ).fetchone()
+    series_links = (
+        connection.execute("SELECT id, event_id FROM series WHERE event_id IS NOT NULL").fetchall()
+        if has_series is not None
+        else []
+    )
 
     foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
     if foreign_keys_enabled:
@@ -597,9 +885,19 @@ def _migrate_events_name_unique_constraint(connection: sqlite3.Connection) -> No
 
             DROP TABLE events;
             ALTER TABLE events_rebuilt RENAME TO events;
-            COMMIT;
             """
         )
+        for table_name, (columns, rows) in dependent_rows.items():
+            if not columns or not rows:
+                continue
+            placeholders = ", ".join("?" for _ in columns)
+            connection.executemany(
+                f"INSERT OR IGNORE INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})",
+                rows,
+            )
+        if series_links:
+            connection.executemany("UPDATE series SET event_id = ? WHERE id = ?", ((event_id, series_id) for series_id, event_id in series_links))
+        connection.commit()
     except Exception:
         connection.rollback()
         raise

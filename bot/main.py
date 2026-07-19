@@ -252,6 +252,25 @@ def format_activity_records(periods: list[object]) -> list[str]:
 def create_event_embed(event: EventView, image_url: str | None = None) -> discord.Embed:
     """Build a concise event card centred on category, dates, and suits."""
     embed = discord.Embed(title=f"🌸 {event.name}", color=discord.Color.from_rgb(255, 183, 197))
+    if event.entity_type == "series":
+        lines: list[str] = []
+        if event.event_type:
+            lines.append(f"📚 分類：{event.event_type}")
+        if event.event_total_cost:
+            lines.append(f"💎 花費：{event.event_total_cost} 鑽")
+        labels = {"main": "👑 主套", "minor": "🎀 小套", "live2d": "✨ Live2D"}
+        for content_type in ("main", "minor", "live2d"):
+            names = [suit.name for suit in event.suits if suit.content_type == content_type]
+            if names:
+                lines.append(f"{labels[content_type]}：\n" + "\n".join(names))
+        if image_url:
+            lines.append("🖼️ 圖片")
+        if event.series_periods:
+            lines.append("📅 檔期：\n" + "\n".join(event.series_periods))
+        if event.description:
+            lines.append(f"📝 備註：{event.description}")
+        embed.description = truncate("\n".join(lines), 4096) if lines else None
+        return embed
     lines: list[str] = []
     if event.event_type:
         lines.append(f"活動分類：{event.event_type}")
@@ -288,7 +307,14 @@ def create_suit_embed(
     """Build a compact suit card from its latest event relation."""
     embed = discord.Embed(title=f"👗 {suit.name}", color=discord.Color.from_rgb(255, 183, 197))
     lines = ["✨ Live2D"] if suit.is_live2d else []
-    if suit.events:
+    if suit.series_names:
+        lines.append(f"🏛️ 所屬系列：{'、'.join(suit.series_names)}")
+        category = next((event.event_type for event in suit.events if event.event_type), None)
+        if category:
+            lines.append(f"🏷️ 活動分類：{category}")
+        elif show_missing_category:
+            lines.append("🏷️ 活動分類：尚未設定")
+    elif suit.events:
         event = suit.events[0]
         lines.append(f"📚 所屬活動：{event.event_name}")
         if event.event_type:
@@ -316,16 +342,10 @@ def create_suit_response_view(suit_id: int, is_admin: bool) -> SuitAdminView | N
 
 
 def create_event_response_view(
-    event_id: int, event_name: str, is_admin: bool
+    event_id: int, event_name: str, is_admin: bool, *, entity_type: str = "event"
 ) -> EventAdminView | None:
     """Only attach event management controls to an administrator response."""
-    return EventAdminView(event_id, event_name) if is_admin else None
-
-
-def add_auto_status_notice(embed: discord.Embed, data_status: str, is_admin: bool) -> None:
-    """Show provenance only to administrators; players see the normal card."""
-    if is_admin and data_status == "auto":
-        embed.set_footer(text="自動建立，尚未確認")
+    return EventAdminView(event_id, event_name, entity_type=entity_type) if is_admin else None
 
 
 async def event_name_autocomplete(
@@ -333,7 +353,7 @@ async def event_name_autocomplete(
 ) -> list[app_commands.Choice[str]]:
     try:
         options = await asyncio.to_thread(
-            KnowledgeQueryRepository().search_event_options, current
+            KnowledgeQueryRepository().search_activity_options, current
         )
     except Exception:
         LOGGER.exception("讀取活動名稱提示失敗。")
@@ -368,13 +388,10 @@ async def event_command(interaction: discord.Interaction, name: str) -> None:
     await interaction.response.defer(thinking=True)
     repository = KnowledgeQueryRepository()
     try:
-        event_id = int(name) if name.isdecimal() else None
-        if event_id is not None:
-            event = await asyncio.to_thread(
-                repository.get_queryable_event_by_id, event_id
-            )
+        if name.isdecimal() or name.startswith("series:"):
+            event = await asyncio.to_thread(repository.get_activity_by_reference, name)
         else:
-            matches = await asyncio.to_thread(repository.get_events_by_name, name)
+            matches = await asyncio.to_thread(repository.get_activities_by_name, name)
             if len(matches) > 1:
                 await interaction.followup.send(
                     "找到多筆同名活動，請從自動完成選擇指定檔期。",
@@ -382,13 +399,7 @@ async def event_command(interaction: discord.Interaction, name: str) -> None:
                 )
                 return
             event = matches[0] if matches else None
-        image_url = (
-            await asyncio.to_thread(
-                repository.get_announcement_image_for_event_id, event.id
-            )
-            if event is not None
-            else None
-        )
+        image_url = await asyncio.to_thread(repository.get_announcement_image_for_event_id, event.id) if event else None
     except Exception:
         LOGGER.exception("查詢活動失敗：%s", name)
         await interaction.followup.send("查詢活動時發生錯誤，請稍後再試。", ephemeral=True)
@@ -397,9 +408,10 @@ async def event_command(interaction: discord.Interaction, name: str) -> None:
         await interaction.followup.send(f"找不到已匯入的活動「{name}」。", ephemeral=True)
         return
     can_manage = is_administrator(interaction) and is_administrator_channel(interaction.channel_id)
-    view = create_event_response_view(event.id, event.name, can_manage)
+    view = create_event_response_view(
+        event.id, event.name, can_manage, entity_type=event.entity_type
+    )
     embed = create_event_embed(event, image_url)
-    add_auto_status_notice(embed, event.data_status, can_manage)
     if view is None:
         await interaction.followup.send(embed=embed)
     else:
@@ -430,7 +442,6 @@ async def suit_command(interaction: discord.Interaction, name: str) -> None:
     embed = create_suit_embed(
         suit, image_url, show_missing_category=can_manage
     )
-    add_auto_status_notice(embed, suit.data_status, can_manage)
     if view is None:
         await interaction.followup.send(embed=embed)
     else:
