@@ -18,13 +18,16 @@ from discord.ext import commands, tasks
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from announcement.dispatcher import dispatch_delivery
+from announcement.models import Announcement
+from announcement.state_store import AnnouncementStateStore
 from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
+from crawler.facebook_crawler import get_latest_posts
 from crawler.models import Post
 from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
-from database.database import init_database
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
 from scripts.data.fetch_raw_posts import fetch_and_save_raw_posts
 from bot.presence import start_presence_rotation
@@ -85,6 +88,7 @@ def load_channel_ids(env_name: str) -> list[int]:
 
 
 ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("ANNOUNCEMENT_CHANNEL_IDS")
+TW_ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("TW_ANNOUNCEMENT_CHANNEL_IDS") or ANNOUNCEMENT_CHANNEL_IDS
 QUERY_CHANNEL_IDS = load_channel_ids("QUERY_CHANNEL_IDS")
 ADMIN_CHANNEL_IDS = load_channel_ids("ADMIN_CHANNEL_IDS")
 
@@ -93,6 +97,8 @@ FACEBOOK_POLL_INTERVAL_MINUTES = 5
 FACEBOOK_POLL_LIMIT = 10
 DISCORD_EMBEDS_PER_MESSAGE = 10
 facebook_initial_poll_complete = asyncio.Event()
+tw_initial_poll_complete = asyncio.Event()
+v2_delivery_recovered = False
 
 
 def is_query_channel(channel_id: int | None) -> bool:
@@ -115,8 +121,8 @@ class MiracleNikkiBot(commands.Bot):
     """Discord client that synchronizes its global application commands."""
 
     async def setup_hook(self) -> None:
-        await asyncio.to_thread(init_database)
-        LOGGER.info("SQLite schema initialized with WAL and a 30-second busy timeout.")
+        await asyncio.to_thread(AnnouncementStateStore)
+        LOGGER.info("v2 announcement state initialized with WAL and a 30-second busy timeout.")
         synced_commands = await self.tree.sync()
         LOGGER.info("已同步 %s 個 Slash Commands。", len(synced_commands))
 
@@ -129,9 +135,14 @@ bot = MiracleNikkiBot(command_prefix="!", intents=intents)
 def create_embed(post: dict[str, object]) -> discord.Embed:
     """Create the existing latest-announcement embed."""
     image_urls = post.get("image_urls") or post.get("images") or []
+    lines = [f"📝 公告內容\n{post.get('content', '')}"]
+    if post.get("publish_time"):
+        lines.append(f"📅 發布時間：{post['publish_time']}")
+    if post.get("post_url"):
+        lines.append(f"🔗 [原文連結]({post['post_url']})")
     embed = discord.Embed(
         title="🌸 奇蹟暖暖最新公告",
-        description=f"📝 公告內容\n{post.get('content', '')}",
+        description="\n\n".join(lines),
         color=discord.Color.from_rgb(255, 183, 197),
     )
     if image_urls:
@@ -160,10 +171,28 @@ def announcement_embed_batches(post: dict[str, object]) -> list[list[discord.Emb
     return batches
 
 
-async def send_post(destination: discord.abc.Messageable, post: dict[str, object]) -> None:
+async def send_post(destination: discord.abc.Messageable, post: dict[str, object]) -> list[int | str]:
     """Send one announcement as ordered embed batches, including every image."""
+    message_ids: list[int | str] = []
     for embeds in announcement_embed_batches(post):
-        await destination.send(embeds=embeds)
+        message = await destination.send(embeds=embeds)
+        message_id = getattr(message, "id", None)
+        if message_id is not None:
+            message_ids.append(message_id)
+    return message_ids
+
+
+async def resolve_announcement_channel(channel_id: int) -> discord.abc.Messageable:
+    """Resolve one configured announcement destination without exposing credentials."""
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException as error:
+            raise RuntimeError(f"Configured announcement channel {channel_id} is unavailable") from error
+    if not hasattr(channel, "send"):
+        raise RuntimeError(f"Configured announcement channel {channel_id} is not messageable")
+    return channel
 
 
 async def send_announcement_post(post: dict[str, object]) -> None:
@@ -171,16 +200,7 @@ async def send_announcement_post(post: dict[str, object]) -> None:
     if not ANNOUNCEMENT_CHANNEL_IDS:
         raise RuntimeError("ANNOUNCEMENT_CHANNEL_IDS is not configured")
     for channel_id in ANNOUNCEMENT_CHANNEL_IDS:
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(channel_id)
-            except discord.HTTPException as error:
-                raise RuntimeError(
-                    f"Configured announcement channel {channel_id} is unavailable"
-                ) from error
-        if not hasattr(channel, "send"):
-            raise RuntimeError(f"Configured announcement channel {channel_id} is not messageable")
+        channel = await resolve_announcement_channel(channel_id)
         await send_post(channel, post)
 
 
@@ -451,14 +471,78 @@ async def suit_command(interaction: discord.Interaction, name: str) -> None:
         await interaction.followup.send(embed=embed, view=view)
 
 
+# Keep the legacy callback objects available for future restoration, but do not
+# register Knowledge commands in the v2 application command tree.
+bot.tree.remove_command("活動")
+bot.tree.remove_command("套裝")
+
+
 @bot.event
 async def on_ready() -> None:
     start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
-    if not poll_facebook_posts.is_running():
-        poll_facebook_posts.start()
-    if not process_announcement_queue.is_running():
-        process_announcement_queue.start()
+    if not poll_tw_announcements.is_running():
+        poll_tw_announcements.start()
+    if not process_v2_announcement_deliveries.is_running():
+        process_v2_announcement_deliveries.start()
+
+
+@tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)
+async def poll_tw_announcements() -> None:
+    """Fetch Taiwan Facebook announcements directly into v2 delivery state."""
+    if not TW_ANNOUNCEMENT_CHANNEL_IDS:
+        LOGGER.error("TW_ANNOUNCEMENT_CHANNEL_IDS or ANNOUNCEMENT_CHANNEL_IDS is not configured.")
+        tw_initial_poll_complete.set()
+        return
+    try:
+        posts = await asyncio.to_thread(get_latest_posts, FACEBOOK_POLL_LIMIT)
+        state = AnnouncementStateStore()
+        for post in posts:
+            state.register(Announcement.from_facebook_post(post), TW_ANNOUNCEMENT_CHANNEL_IDS)
+        LOGGER.info("v2 Taiwan Facebook poll completed fetched=%s", len(posts))
+        if len(posts) < FACEBOOK_POLL_LIMIT:
+            LOGGER.warning(
+                "Facebook exposed %s post(s), fewer than poll limit %s.",
+                len(posts),
+                FACEBOOK_POLL_LIMIT,
+            )
+    except Exception:
+        LOGGER.exception("v2 Taiwan Facebook poll failed; pending v2 deliveries remain retryable.")
+    finally:
+        tw_initial_poll_complete.set()
+
+
+@tasks.loop(minutes=1)
+async def process_v2_announcement_deliveries() -> None:
+    """Deliver persisted v2 announcement targets without touching legacy Queue tables."""
+    global v2_delivery_recovered
+    await tw_initial_poll_complete.wait()
+    state = AnnouncementStateStore()
+    if not v2_delivery_recovered:
+        recovered = await asyncio.to_thread(state.recover_interrupted_deliveries)
+        if recovered:
+            LOGGER.warning("Recovered %s interrupted v2 announcement delivery(s).", recovered)
+        v2_delivery_recovered = True
+    delivery_limit = MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE * max(1, len(TW_ANNOUNCEMENT_CHANNEL_IDS))
+    deliveries = await asyncio.to_thread(state.claim_deliveries, delivery_limit)
+    for delivery in deliveries:
+        try:
+            message_ids = await dispatch_delivery(delivery, resolve_announcement_channel, send_post)
+            await asyncio.to_thread(state.mark_delivery_sent, delivery.delivery_id, message_ids)
+            LOGGER.info(
+                "v2 announcement delivery sent source=%s external_id=%s channel=%s",
+                delivery.announcement.source,
+                delivery.announcement.external_id,
+                delivery.channel_id,
+            )
+        except Exception as error:
+            await asyncio.to_thread(state.mark_delivery_failed, delivery.delivery_id, str(error))
+            LOGGER.exception(
+                "v2 announcement delivery failed source=%s external_id=%s channel=%s",
+                delivery.announcement.source,
+                delivery.announcement.external_id,
+                delivery.channel_id,
+            )
 
 
 @tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)

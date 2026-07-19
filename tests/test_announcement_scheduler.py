@@ -155,16 +155,16 @@ def test_on_ready_starts_each_background_task_only_once(monkeypatch):
             starts.append(self.name)
             self.running = True
 
-    facebook_task = FakeTask("facebook")
-    queue_task = FakeTask("queue")
-    monkeypatch.setattr(bot_main, "poll_facebook_posts", facebook_task)
-    monkeypatch.setattr(bot_main, "process_announcement_queue", queue_task)
+    facebook_task = FakeTask("tw-facebook")
+    delivery_task = FakeTask("v2-delivery")
+    monkeypatch.setattr(bot_main, "poll_tw_announcements", facebook_task)
+    monkeypatch.setattr(bot_main, "process_v2_announcement_deliveries", delivery_task)
     monkeypatch.setattr(bot_main, "start_presence_rotation", lambda _bot: None)
 
     asyncio.run(bot_main.on_ready())
     asyncio.run(bot_main.on_ready())
 
-    assert starts == ["facebook", "queue"]
+    assert starts == ["tw-facebook", "v2-delivery"]
 
 
 def test_pending_job_sends_even_when_the_feed_no_longer_returns_the_post(monkeypatch, tmp_path):

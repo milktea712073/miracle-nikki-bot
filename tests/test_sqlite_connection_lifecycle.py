@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -130,9 +131,11 @@ def test_repository_rollback_releases_a_write_lock_after_an_error(tmp_path, monk
         connection.close()
 
 
-def test_bot_startup_initializes_all_required_tables(tmp_path, monkeypatch) -> None:
-    database_path = tmp_path / "bot-startup.db"
-    monkeypatch.setattr(bot_main, "init_database", lambda: init_database(database_path))
+def test_bot_startup_initializes_only_v2_announcement_state(tmp_path, monkeypatch) -> None:
+    database_path = tmp_path / "announcement-state.db"
+    from announcement.state_store import AnnouncementStateStore
+
+    monkeypatch.setattr(bot_main, "AnnouncementStateStore", lambda: AnnouncementStateStore(database_path))
 
     async def fake_sync() -> list[object]:
         return []
@@ -140,7 +143,7 @@ def test_bot_startup_initializes_all_required_tables(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(bot_main.bot.tree, "sync", fake_sync)
     asyncio.run(bot_main.bot.setup_hook())
 
-    connection = get_connection(database_path)
+    connection = sqlite3.connect(database_path)
     try:
         table_names = {
             row[0]
@@ -152,11 +155,8 @@ def test_bot_startup_initializes_all_required_tables(tmp_path, monkeypatch) -> N
         connection.close()
 
     assert {
-        "raw_posts",
-        "raw_post_images",
-        "announcement_jobs",
-        "parse_drafts",
-        "events",
-        "suits",
-        "draft_reviews",
+        "announcements",
+        "announcement_deliveries",
+        "reminders",
     }.issubset(table_names)
+    assert {"raw_posts", "announcement_jobs", "events", "suits"}.isdisjoint(table_names)
