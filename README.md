@@ -1,5 +1,71 @@
 # miracle-nikki-bot
 
+## Official Announcement Pipeline
+
+現役產品只同步台服與陸服官網公告：
+
+```text
+Official Website
+        │
+        ▼
+Crawler
+        │
+        ▼
+AnnouncementStateStore
+        │
+        ▼
+Pending Delivery
+        │
+        ▼
+Dispatcher
+        │
+        ▼
+Discord
+```
+
+Crawler 只取公告資料；`AnnouncementStateStore` 管理去重、baseline 與各頻道送達狀態；Dispatcher 是唯一 Discord 送達路徑。詳見 [Official Announcement Pipeline](docs/official_announcement_pipeline.md)。
+
+### 第一次部署
+
+```powershell
+python scripts/announcement/initialize_official_baseline.py
+python bot/main.py
+```
+
+Baseline 只記錄各來源目前最新公告，不建立 delivery、不發送 Discord。之後 poller 只推播 baseline 之後的新公告，不會補送歷史公告。
+
+### Replay
+
+使用明確指定的頻道重複測試最新公告的 Discord Embed：
+
+```powershell
+python scripts/announcement/replay_latest_official.py --source tw --channel-id 123456789012345678 --replay
+python scripts/announcement/replay_latest_official.py --source cn --channel-id 123456789012345678 --replay
+```
+
+Replay 不啟動完整 Bot，也不會回退使用預設公告頻道；它只重設該次指定頻道的 pending delivery。
+
+### Dry Run
+
+```powershell
+python scripts/announcement/initialize_official_baseline.py --dry-run
+python scripts/announcement/replay_latest_official.py --source tw --dry-run
+python scripts/announcement/replay_latest_official.py --source cn --dry-run
+```
+
+Dry-run 只顯示最新公告，完全不變更 state 或發送 Discord。
+
+### 官方公告頻道設定
+
+在 `.env` 設定逗號分隔的 Discord channel IDs：
+
+```dotenv
+TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=111111111111111111
+CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=222222222222222222
+```
+
+`TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS` 用於台服官網公告。`CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS` 用於陸服官網公告且必須明確設定。請勿提交真實 ID 或 token。
+
 Python 專案骨架，用於開發《奇蹟暖暖》相關的資料爬取、資料庫與機器人功能。
 
 ## 環境設定（Conda）

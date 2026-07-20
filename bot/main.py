@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from announcement.dispatcher import dispatch_delivery
-from announcement.models import Announcement
+from announcement.models import Announcement, CN_OFFICIAL, TW_OFFICIAL
 from announcement.state_store import AnnouncementStateStore
 from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.admin.knowledge_event_views import EventAdminView
@@ -32,6 +32,8 @@ from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
 from crawler.facebook_crawler import get_latest_posts
 from crawler.models import Post
+from crawler.cn_official_crawler import fetch_recent_announcements as fetch_cn_official_announcements
+from crawler.tw_official_crawler import fetch_recent_announcements as fetch_tw_official_announcements
 from database.announcement_job_repository import AnnouncementJob, AnnouncementJobRepository
 from database.knowledge_query_repository import EventView, KnowledgeQueryRepository, SuitView
 from scripts.data.fetch_raw_posts import fetch_and_save_raw_posts
@@ -94,15 +96,22 @@ def load_channel_ids(env_name: str) -> list[int]:
 
 ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("ANNOUNCEMENT_CHANNEL_IDS")
 TW_ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("TW_ANNOUNCEMENT_CHANNEL_IDS") or ANNOUNCEMENT_CHANNEL_IDS
+TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS = (
+    load_channel_ids("TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS") or TW_ANNOUNCEMENT_CHANNEL_IDS
+)
+CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS")
 QUERY_CHANNEL_IDS = load_channel_ids("QUERY_CHANNEL_IDS")
 ADMIN_CHANNEL_IDS = load_channel_ids("ADMIN_CHANNEL_IDS")
 
 MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE = 3
 FACEBOOK_POLL_INTERVAL_MINUTES = 5
 FACEBOOK_POLL_LIMIT = 10
+OFFICIAL_POLL_INTERVAL_MINUTES = 5
+OFFICIAL_POLL_LIMIT = 10
 DISCORD_EMBEDS_PER_MESSAGE = 10
 facebook_initial_poll_complete = asyncio.Event()
 tw_initial_poll_complete = asyncio.Event()
+official_initial_poll_complete = asyncio.Event()
 v2_delivery_recovered = False
 
 
@@ -146,7 +155,7 @@ def create_embed(post: dict[str, object]) -> discord.Embed:
     if post.get("post_url"):
         lines.append(f"🔗 [原文連結]({post['post_url']})")
     embed = discord.Embed(
-        title="🌸 奇蹟暖暖最新公告",
+        title=str(post.get("title") or "🌸 奇蹟暖暖最新公告"),
         description="\n\n".join(lines),
         color=discord.Color.from_rgb(255, 183, 197),
     )
@@ -486,6 +495,66 @@ bot.tree.remove_command("套裝")
 async def on_ready() -> None:
     start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
+    if not poll_official_announcements.is_running():
+        poll_official_announcements.start()
+    if not process_v2_announcement_deliveries.is_running():
+        process_v2_announcement_deliveries.start()
+
+
+@tasks.loop(minutes=OFFICIAL_POLL_INTERVAL_MINUTES)
+async def poll_official_announcements() -> None:
+    """Poll official Taiwan and China sources into v2 state, without legacy storage."""
+    state = AnnouncementStateStore()
+    sources = (
+        ("TW official", TW_OFFICIAL, fetch_tw_official_announcements, TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS),
+        ("CN official", CN_OFFICIAL, fetch_cn_official_announcements, CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS),
+    )
+    try:
+        for label, source, crawler, channel_ids in sources:
+            if not channel_ids:
+                LOGGER.warning("%s announcement channels are not configured; source poll skipped.", label)
+                continue
+            try:
+                announcements = await asyncio.to_thread(crawler, OFFICIAL_POLL_LIMIT)
+                baseline = await asyncio.to_thread(state.get_official_baseline, source)
+                if baseline is None:
+                    LOGGER.warning(
+                        "%s baseline is not initialized; no announcements were queued. "
+                        "Run initialize_official_baseline.py first.",
+                        label,
+                    )
+                    continue
+                new_announcements = [
+                    announcement
+                    for announcement in announcements
+                    if _is_newer_official_external_id(announcement.external_id, baseline)
+                ]
+                for announcement in sorted(
+                    new_announcements, key=lambda item: int(item.external_id)
+                ):
+                    await asyncio.to_thread(state.register, announcement, channel_ids)
+                if new_announcements:
+                    latest_external_id = max(
+                        new_announcements, key=lambda item: int(item.external_id)
+                    ).external_id
+                    await asyncio.to_thread(state.set_official_baseline, source, latest_external_id)
+                LOGGER.info(
+                    "%s poll completed fetched=%s queued=%s baseline=%s",
+                    label, len(announcements), len(new_announcements), baseline,
+                )
+            except Exception:
+                LOGGER.exception("%s poll failed; other official sources remain available.", label)
+    finally:
+        official_initial_poll_complete.set()
+
+
+def _is_newer_official_external_id(candidate: str, baseline: str) -> bool:
+    """Official website IDs are numeric and monotonically increase per source."""
+    try:
+        return int(candidate) > int(baseline)
+    except ValueError:
+        LOGGER.warning("Official external ID is not numeric candidate=%r baseline=%r", candidate, baseline)
+        return False
 
 
 @tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)
@@ -515,17 +584,21 @@ async def poll_tw_announcements() -> None:
 
 @tasks.loop(minutes=1)
 async def process_v2_announcement_deliveries() -> None:
-    """DEPRECATED: retained v2 dispatcher; never auto-scheduled during the source pause."""
+    """Deliver only persisted official-site announcements through the existing dispatcher."""
     global v2_delivery_recovered
-    await tw_initial_poll_complete.wait()
+    await official_initial_poll_complete.wait()
     state = AnnouncementStateStore()
     if not v2_delivery_recovered:
         recovered = await asyncio.to_thread(state.recover_interrupted_deliveries)
         if recovered:
             LOGGER.warning("Recovered %s interrupted v2 announcement delivery(s).", recovered)
         v2_delivery_recovered = True
-    delivery_limit = MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE * max(1, len(TW_ANNOUNCEMENT_CHANNEL_IDS))
-    deliveries = await asyncio.to_thread(state.claim_deliveries, delivery_limit)
+    delivery_limit = MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE * max(
+        1, len(TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS) + len(CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS)
+    )
+    deliveries = await asyncio.to_thread(
+        state.claim_deliveries, delivery_limit, sources=(TW_OFFICIAL, CN_OFFICIAL)
+    )
     for delivery in deliveries:
         try:
             message_ids = await dispatch_delivery(delivery, resolve_announcement_channel, send_post)

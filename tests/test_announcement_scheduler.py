@@ -140,7 +140,7 @@ def test_queue_failure_does_not_stop_later_facebook_poll(monkeypatch, tmp_path):
     assert calls == [(bot_main.FACEBOOK_POLL_LIMIT, True)]
 
 
-def test_on_ready_does_not_start_retained_facebook_or_delivery_tasks(monkeypatch):
+def test_on_ready_starts_only_official_poll_and_delivery_tasks(monkeypatch):
     starts: list[str] = []
 
     class FakeTask:
@@ -155,16 +155,16 @@ def test_on_ready_does_not_start_retained_facebook_or_delivery_tasks(monkeypatch
             starts.append(self.name)
             self.running = True
 
-    facebook_task = FakeTask("tw-facebook")
+    facebook_task = FakeTask("official-sites")
     delivery_task = FakeTask("v2-delivery")
-    monkeypatch.setattr(bot_main, "poll_tw_announcements", facebook_task)
+    monkeypatch.setattr(bot_main, "poll_official_announcements", facebook_task)
     monkeypatch.setattr(bot_main, "process_v2_announcement_deliveries", delivery_task)
     monkeypatch.setattr(bot_main, "start_presence_rotation", lambda _bot: None)
 
     asyncio.run(bot_main.on_ready())
     asyncio.run(bot_main.on_ready())
 
-    assert starts == []
+    assert starts == ["official-sites", "v2-delivery"]
 
 
 def test_pending_job_sends_even_when_the_feed_no_longer_returns_the_post(monkeypatch, tmp_path):

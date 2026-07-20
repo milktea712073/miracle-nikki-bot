@@ -100,14 +100,69 @@ class AnnouncementStateStore:
 
                 CREATE INDEX IF NOT EXISTS idx_v2_delivery_status
                     ON announcement_deliveries(status, created_at);
+
+                CREATE TABLE IF NOT EXISTS official_baselines (
+                    source TEXT PRIMARY KEY,
+                    external_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
+            )
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(announcements)").fetchall()
+            }
+            for column_sql in (
+                "title TEXT NOT NULL DEFAULT ''",
+                "category TEXT",
+                "content_html TEXT",
+            ):
+                column_name = column_sql.split()[0]
+                if column_name not in columns:
+                    connection.execute(f"ALTER TABLE announcements ADD COLUMN {column_sql}")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def get_official_baseline(self, source: str) -> str | None:
+        """Return the last known official notice identity for one source."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT external_id FROM official_baselines WHERE source = ?", (source,)
+            ).fetchone()
+            return str(row[0]) if row is not None else None
+        finally:
+            connection.close()
+
+    def set_official_baseline(self, source: str, external_id: str) -> None:
+        """Persist one official source's latest known external identifier."""
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO official_baselines (source, external_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    external_id = excluded.external_id, updated_at = excluded.updated_at
+                """,
+                (source, str(external_id), utc_now()),
             )
             connection.commit()
         finally:
             connection.close()
 
-    def register(self, announcement: Announcement, channel_ids: Iterable[int]) -> int:
-        """Store one announcement and snapshot delivery targets only on first discovery."""
+    def register(
+        self,
+        announcement: Announcement,
+        channel_ids: Iterable[int],
+        *,
+        reset_deliveries: bool = False,
+    ) -> int:
+        """Store one announcement and optionally reset only explicit target deliveries.
+
+        Normal polling uses the default snapshot behaviour. Explicit replay tools
+        pass ``reset_deliveries=True`` to requeue only the supplied channels.
+        """
         channels = tuple(dict.fromkeys(int(channel_id) for channel_id in channel_ids))
         now = utc_now()
         connection = self._connect()
@@ -121,16 +176,20 @@ class AnnouncementStateStore:
                 cursor = connection.execute(
                     """
                     INSERT INTO announcements (
-                        source, external_id, canonical_url, content, image_urls_json, published_at,
+                        source, external_id, canonical_url, title, category, content_html,
+                        content, image_urls_json, published_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         announcement.source,
                         announcement.external_id,
                         announcement.canonical_url,
-                        announcement.content,
-                        json.dumps(announcement.image_urls, ensure_ascii=False),
+                        announcement.title,
+                        announcement.category,
+                        announcement.content_html,
+                        announcement.content_text,
+                        json.dumps(announcement.images, ensure_ascii=False),
                         announcement.published_at.isoformat() if announcement.published_at else None,
                         now,
                         now,
@@ -150,18 +209,35 @@ class AnnouncementStateStore:
                 connection.execute(
                     """
                     UPDATE announcements
-                    SET canonical_url = ?, content = ?, image_urls_json = ?, published_at = ?, updated_at = ?
+                    SET canonical_url = ?, title = ?, category = ?, content_html = ?, content = ?,
+                        image_urls_json = ?, published_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         announcement.canonical_url,
-                        announcement.content,
-                        json.dumps(announcement.image_urls, ensure_ascii=False),
+                        announcement.title,
+                        announcement.category,
+                        announcement.content_html,
+                        announcement.content_text,
+                        json.dumps(announcement.images, ensure_ascii=False),
                         announcement.published_at.isoformat() if announcement.published_at else None,
                         now,
                         announcement_id,
                     ),
                 )
+                if reset_deliveries:
+                    connection.executemany(
+                        """
+                        INSERT INTO announcement_deliveries (
+                            announcement_id, channel_id, status, attempt_count, last_error,
+                            message_ids_json, created_at, updated_at, sent_at
+                        ) VALUES (?, ?, 'pending', 0, NULL, '[]', ?, ?, NULL)
+                        ON CONFLICT(announcement_id, channel_id) DO UPDATE SET
+                            status = 'pending', attempt_count = 0, last_error = NULL,
+                            message_ids_json = '[]', updated_at = excluded.updated_at, sent_at = NULL
+                        """,
+                        [(announcement_id, channel_id, now, now) for channel_id in channels],
+                    )
             connection.commit()
             return announcement_id
         except Exception:
@@ -187,22 +263,36 @@ class AnnouncementStateStore:
         finally:
             connection.close()
 
-    def claim_deliveries(self, limit: int) -> list[PendingDelivery]:
+    def claim_deliveries(
+        self, limit: int, *, sources: Iterable[str] | None = None
+    ) -> list[PendingDelivery]:
         if limit < 1:
             return []
+        source_values = tuple(dict.fromkeys(str(source) for source in sources or ()))
         connection = self._connect()
         now = utc_now()
         try:
             connection.execute("BEGIN")
+            source_clause = ""
+            parameters: list[object] = []
+            if source_values:
+                source_clause = " AND a.source IN (" + ", ".join("?" for _ in source_values) + ")"
+                parameters.extend(source_values)
+            parameters.append(limit)
             rows = connection.execute(
                 """
                 SELECT d.id, d.announcement_id, d.channel_id
                 FROM announcement_deliveries AS d
+                JOIN announcements AS a ON a.id = d.announcement_id
                 WHERE d.status IN ('pending', 'failed')
+                """
+                + source_clause
+                +
+                """
                 ORDER BY d.created_at, d.id
                 LIMIT ?
                 """,
-                (limit,),
+                parameters,
             ).fetchall()
             delivery_ids = [int(row[0]) for row in rows]
             connection.executemany(
@@ -227,7 +317,8 @@ class AnnouncementStateStore:
             row = connection.execute(
                 """
                 SELECT d.id, d.announcement_id, d.channel_id, a.source, a.external_id,
-                       a.canonical_url, a.content, a.image_urls_json, a.published_at
+                       a.canonical_url, a.title, a.category, a.content_html, a.content,
+                       a.image_urls_json, a.published_at
                 FROM announcement_deliveries AS d
                 JOIN announcements AS a ON a.id = d.announcement_id
                 WHERE d.id = ?
@@ -236,14 +327,17 @@ class AnnouncementStateStore:
             ).fetchone()
             if row is None:
                 return None
-            published_at = datetime.fromisoformat(row[8]) if row[8] else None
+            published_at = datetime.fromisoformat(row[11]) if row[11] else None
             return PendingDelivery(
                 delivery_id=int(row[0]),
                 announcement_id=int(row[1]),
                 channel_id=int(row[2]),
                 announcement=Announcement(
-                    source=str(row[3]), external_id=str(row[4]), canonical_url=str(row[5]),
-                    content=str(row[6]), image_urls=tuple(json.loads(str(row[7]))), published_at=published_at,
+                    source=str(row[3]), external_id=str(row[4]), url=str(row[5]),
+                    title=str(row[6]), category=str(row[7]) if row[7] is not None else None,
+                    content_html=str(row[8]) if row[8] is not None else None,
+                    content_text=str(row[9]), images=tuple(json.loads(str(row[10]))),
+                    published_at=published_at,
                 ),
             )
         finally:
@@ -313,9 +407,13 @@ class AnnouncementStateStore:
             Announcement(
                 source=TW_FACEBOOK_SOURCE,
                 external_id=_external_id_from_url(url),
-                canonical_url=canonical_announcement_url(TW_FACEBOOK_SOURCE, url),
-                content="",
-                image_urls=(),
+                url=canonical_announcement_url(TW_FACEBOOK_SOURCE, url),
+                title="",
+                category=None,
+                published_at=None,
+                content_html=None,
+                content_text="",
+                images=(),
             )
             for url in sorted(urls)
         )

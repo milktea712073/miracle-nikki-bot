@@ -2,10 +2,10 @@
 
 ## Active At Normal Bot Startup
 
-`bot/main.py` initializes the standalone v2 announcement-state SQLite file and
-starts Discord presence rotation. It does **not** register Knowledge commands
-or start a content source, crawler, announcement worker, parser, or Knowledge
-auto-import task.
+`bot/main.py` initializes the standalone v2 announcement-state SQLite file,
+starts Discord presence rotation, polls the Taiwan and China **official website**
+sources, and delivers their persisted announcements. It does **not** register
+Knowledge commands or start Facebook, a parser, or Knowledge auto-import task.
 
 The application-command callbacks for `/活動` and `/套裝` remain as retained
 code, but are explicitly removed from the command tree before `tree.sync()`.
