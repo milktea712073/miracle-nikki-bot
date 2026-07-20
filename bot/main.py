@@ -1,4 +1,9 @@
-"""Discord entry point for announcements, knowledge lookups, and review UI."""
+"""Discord entry point for the active v2 shell and retained legacy code.
+
+The Facebook polling, Knowledge query callbacks, and administration views below
+are intentionally retained for historical recovery only. They are not
+registered or scheduled by the normal bot startup path.
+"""
 
 from __future__ import annotations
 
@@ -481,15 +486,11 @@ bot.tree.remove_command("套裝")
 async def on_ready() -> None:
     start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
-    if not poll_tw_announcements.is_running():
-        poll_tw_announcements.start()
-    if not process_v2_announcement_deliveries.is_running():
-        process_v2_announcement_deliveries.start()
 
 
 @tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)
 async def poll_tw_announcements() -> None:
-    """Fetch Taiwan Facebook announcements directly into v2 delivery state."""
+    """DEPRECATED: retained Facebook-to-v2-state poller; never auto-scheduled."""
     if not TW_ANNOUNCEMENT_CHANNEL_IDS:
         LOGGER.error("TW_ANNOUNCEMENT_CHANNEL_IDS or ANNOUNCEMENT_CHANNEL_IDS is not configured.")
         tw_initial_poll_complete.set()
@@ -514,7 +515,7 @@ async def poll_tw_announcements() -> None:
 
 @tasks.loop(minutes=1)
 async def process_v2_announcement_deliveries() -> None:
-    """Deliver persisted v2 announcement targets without touching legacy Queue tables."""
+    """DEPRECATED: retained v2 dispatcher; never auto-scheduled during the source pause."""
     global v2_delivery_recovered
     await tw_initial_poll_complete.wait()
     state = AnnouncementStateStore()
@@ -547,7 +548,7 @@ async def process_v2_announcement_deliveries() -> None:
 
 @tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)
 async def poll_facebook_posts() -> None:
-    """Fetch Facebook posts and enqueue only genuinely new canonical URLs."""
+    """DEPRECATED: retained Facebook raw-archive poller; never auto-scheduled."""
     try:
         result = await asyncio.to_thread(
             fetch_and_save_raw_posts,
@@ -577,7 +578,7 @@ async def poll_facebook_posts() -> None:
 
 @tasks.loop(minutes=5)
 async def process_announcement_queue() -> None:
-    """Deliver durable queued jobs; never choose announcements from the live feed."""
+    """DEPRECATED: retained legacy Queue worker; never auto-scheduled."""
     if poll_facebook_posts.is_running():
         await facebook_initial_poll_complete.wait()
     repository = AnnouncementJobRepository()
