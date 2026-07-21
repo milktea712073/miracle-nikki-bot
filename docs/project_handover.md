@@ -1,3 +1,13 @@
+# Archived：舊 Knowledge／Facebook 架構交接文件
+
+> **此文件已過時，保留作歷史追溯。** 它描述的是 Query-as-Review、Facebook live crawler、Knowledge DB、Parser、活動／套裝與舊 announcement queue 的設計，不是目前正式公告同步架構。
+>
+> 請優先閱讀：
+> - [專案首頁](../README.md)
+> - [現役系統架構](ARCHITECTURE.md)
+> - [正式部署與日常維運](DEPLOY.md)
+> - [Legacy Runtime Inventory](legacy_runtime_inventory.md)
+
 # Miracle Nikki Bot 專案交接說明
 
 ## 1. 專案目的

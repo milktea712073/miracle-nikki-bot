@@ -1,4 +1,8 @@
-# Legacy Runtime Inventory
+# Legacy Runtime Inventory（封存執行期盤點）
+
+> **文件用途：** 說明仍保留在倉庫、但不屬於目前正式公告同步主線的程式與入口。
+> 正式架構請見 [README](../README.md)、[系統架構](ARCHITECTURE.md) 與[部署手冊](DEPLOY.md)。
+> 下方既有英文盤點內容保留作技術追溯；不得將列出的 Facebook、Knowledge 或 Parser 元件視為正式 VM 的啟動流程。
 
 ## Active At Normal Bot Startup
 

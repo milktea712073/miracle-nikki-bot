@@ -1,153 +1,146 @@
-# miracle-nikki-bot
+# Miracle Nikki Bot
 
-## Official Announcement Pipeline
+Miracle Nikki Bot 是一個將《奇蹟暖暖》台服與陸服**官方網站公告**同步至 Discord 的 Python Bot。
 
-現役產品只同步台服與陸服官網公告：
+## 目前產品方向
+
+現役功能只聚焦於官方公告同步：
+
+- 台服官方網站公告
+- 陸服官方網站公告
+- Discord Embed、原文連結與依序圖片
+- 每來源、每頻道的公告去重與送達重試
+
+Facebook crawler、JoyBomb Wayback、Knowledge DB、Parser、活動／套裝／Series 與舊 Discord 管理功能均保留作歷史資料、研究或維護用途，但**不是正式部署主流程**。
+
+## 現役資料流
 
 ```text
-Official Website
-        │
-        ▼
-Crawler
-        │
-        ▼
-AnnouncementStateStore
-        │
-        ▼
-Pending Delivery
-        │
-        ▼
-Dispatcher
-        │
-        ▼
-Discord
+台服官方網站             陸服官方網站
+      │                       │
+      └─────── Crawler ───────┘
+                    │
+                    ▼
+              Announcement
+                    │
+                    ▼
+         AnnouncementStateStore
+                    │
+                    ▼
+      Pending Delivery（每個頻道）
+                    │
+                    ▼
+               Dispatcher
+                    │
+                    ▼
+                 Discord
 ```
 
-Crawler 只取公告資料；`AnnouncementStateStore` 管理去重、baseline 與各頻道送達狀態；Dispatcher 是唯一 Discord 送達路徑。詳見 [Official Announcement Pipeline](docs/official_announcement_pipeline.md)。
+- 台服：`crawler/tw_official_crawler.py`
+- 陸服：`crawler/cn_official_crawler.py`
+- 狀態資料庫：`database/announcement_state.db`
+- Bot runtime：`bot/main.py`
 
-### 第一次部署
+Poller 每 5 分鐘檢查兩個官方來源；delivery worker 每分鐘處理 pending 或可重試的 delivery。
+
+## 快速開始
+
+### 本機開發
 
 ```powershell
-python scripts/announcement/initialize_official_baseline.py
-python bot/main.py
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Baseline 只記錄各來源目前最新公告，不建立 delivery、不發送 Discord。之後 poller 只推播 baseline 之後的新公告，不會補送歷史公告。
+將 `.env.example` 複製為本機 `.env`，填入**測試** Discord Bot token 與測試頻道 ID。不要提交 `.env`。
 
-### Replay
-
-使用明確指定的頻道重複測試最新公告的 Discord Embed：
-
-```powershell
-python scripts/announcement/replay_latest_official.py --source tw --channel-id 123456789012345678 --replay
-python scripts/announcement/replay_latest_official.py --source cn --channel-id 123456789012345678 --replay
-```
-
-Replay 不啟動完整 Bot，也不會回退使用預設公告頻道；它只重設該次指定頻道的 pending delivery。
-
-### Dry Run
+第一次建立新的公告 state 前，先初始化 baseline：
 
 ```powershell
 python scripts/announcement/initialize_official_baseline.py --dry-run
-python scripts/announcement/replay_latest_official.py --source tw --dry-run
-python scripts/announcement/replay_latest_official.py --source cn --dry-run
+python scripts/announcement/initialize_official_baseline.py
 ```
 
-Dry-run 只顯示最新公告，完全不變更 state 或發送 Discord。
+這只記錄目前最新公告，不會補送歷史公告或直接發送 Discord。之後可啟動 Bot：
 
-### 官方公告頻道設定
+```powershell
+python bot/main.py
+```
 
-在 `.env` 設定逗號分隔的 Discord channel IDs：
+完整本機開發流程請見 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+
+### 測試
+
+```powershell
+python -m pytest -q --basetemp=.pytest-runtime
+```
+
+### 正式部署
+
+Google Cloud Compute Engine 的部署、systemd、日常更新、日誌與備份請見 [docs/DEPLOY.md](docs/DEPLOY.md)。
+
+## 官方公告工具
+
+### Baseline
+
+```powershell
+python scripts/announcement/initialize_official_baseline.py --dry-run
+python scripts/announcement/initialize_official_baseline.py
+```
+
+只在全新的 `announcement_state.db` 第一次部署時執行正式初始化。日常更新或重啟時不要重跑。
+
+### Replay
+
+Replay 用於驗證指定公告在測試頻道的 Discord 呈現。它只建立或重設明確指定頻道的 pending delivery；Dispatcher 仍是唯一送達路徑。
+
+```powershell
+python scripts/announcement/replay_latest_official.py --source tw --dry-run
+python scripts/announcement/replay_latest_official.py --source cn --external-id 988639 --dry-run
+
+python scripts/announcement/replay_latest_official.py --source tw --channel-id 123456789012345678 --replay
+python scripts/announcement/replay_latest_official.py --source cn --external-id 988639 --channel-id 123456789012345678 --replay
+```
+
+## 設定
+
+現役 pipeline 至少使用下列 `.env` 變數：
 
 ```dotenv
-TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=111111111111111111
-CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=222222222222222222
+DISCORD_TOKEN=
+TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=
+CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=
 ```
 
-`TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS` 用於台服官網公告。`CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS` 用於陸服官網公告且必須明確設定。請勿提交真實 ID 或 token。
+- `DISCORD_TOKEN`：Discord Bot token。
+- `TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：台服公告目標頻道，可用逗號分隔多個 ID。
+- `CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：陸服公告目標頻道，可用逗號分隔多個 ID。
 
-Python 專案骨架，用於開發《奇蹟暖暖》相關的資料爬取、資料庫與機器人功能。
+不要將 token、channel ID、外部 IP、deploy key、`.env`、SQLite database 或 backup 提交至 Git。
 
-## 環境設定（Conda）
+## 文件索引
 
-```powershell
-conda env create -f environment.yml
-conda activate miracle-nikki-bot
-```
+| 文件 | 用途 |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 現役系統架構、責任分層、資料流與 legacy 邊界 |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 本機開發、測試 Bot、測試、提交與雲端更新流程 |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | 正式 VM 日常維運、systemd、日誌與故障排除 |
+| [docs/deployment_google_cloud.md](docs/deployment_google_cloud.md) | Google Cloud VM 建立與完整部署細節 |
+| [docs/official_announcement_pipeline.md](docs/official_announcement_pipeline.md) | AnnouncementStateStore、baseline、delivery 與 replay 設計 |
+| [docs/legacy_runtime_inventory.md](docs/legacy_runtime_inventory.md) | 已停用但保留的 Facebook／Knowledge／Parser runtime 元件 |
+| [docs/archive/README_legacy.md](docs/archive/README_legacy.md) | v2 前的 README 歷史內容 |
 
-如要安裝之後新增的套件：
+## Legacy／Archived 功能
 
-```powershell
-pip install -r requirements.txt
-```
+以下程式與資料仍保留，但不得視為正式公告同步部署流程：
 
-## 啟動 Bot
+- `crawler/facebook_crawler.py` 與 Facebook session／Playwright 工具
+- `crawler/joybomb_archive_crawler.py` 與 Wayback 研究資料
+- `parser/`、`content/section_splitter.py`、`knowledge/`
+- `database/database.db`、`raw_posts`、`parse_drafts`、`events`、`suits` 等舊 Knowledge 資料
+- `scripts/data/rebuild_database.py`、`scripts/data/reset_database.py` 與各種舊 Queue repair／requeue 工具
+- 舊 Discord `/活動`、`/套裝`、草稿與管理 UI 的保留程式碼
 
-以 `.env.example` 建立本機 `.env`，填入 Discord Bot Token 與頻道設定後，可在 VS Code 選取目前的 Conda interpreter，按 `F5` 執行 **Run Miracle Nikki Bot**。此設定會啟動 `${workspaceFolder}/bot/main.py`，不會寫死 Python 路徑。
-
-`.env` 至少需要設定：`DISCORD_TOKEN`、`ANNOUNCEMENT_CHANNEL_IDS`、`QUERY_CHANNEL_IDS`、`ADMIN_CHANNEL_IDS`。管理員白名單可選擇設定 `DISCORD_ADMIN_USER_IDS` 與 `DISCORD_ADMIN_ROLE_IDS`；多個 ID 使用半形逗號分隔。
-
-## 管理資料
-
-使用 `/活動` 與 `/套裝` 查詢資料；管理員可在管理頻道的資料卡上使用編輯按鈕校正內容。`parse_drafts` 與 `parse_draft_suits` 是 Parser 的內部中間與稽核資料，日常不再提供 Discord 草稿審核指令。
-
-## 開發與維運工具
-
-所有工具會依檔案位置解析專案根目錄；從其他工作目錄呼叫時，請使用該 script 的實際路徑。先使用 `--help` 查看參數；下列範例不含任何真實帳號、網址或頻道資料。
-
-**日常資料流程**
-
-- `scripts/data/fetch_raw_posts.py`：抓取 Facebook 原始貼文並寫入本機資料庫；會修改資料庫，不發送 Discord。
-  `python scripts/data/fetch_raw_posts.py --limit 10`
-- `scripts/data/parse_raw_posts.py`：解析待處理原始貼文並更新知識庫；會修改資料庫。
-  `python scripts/data/parse_raw_posts.py --limit 10`
-
-**資料庫維護**
-
-- `scripts/data/rebuild_database.py`：開發用重建資料；會清除可再生資料並要求精確輸入 `YES`。預設保留公告 Queue。
-  `python scripts/data/rebuild_database.py --limit 50`
-- `scripts/data/reset_database.py`：危險工具，清空業務資料、重設 AUTOINCREMENT 並要求精確輸入 `YES`。
-  `python scripts/data/reset_database.py`
-- `scripts/data/cleanup_auto_suits.py`：預設只列出不合法的自動建立套裝；使用 `--apply` 後仍須輸入 `YES` 才會刪除。
-  `python scripts/data/cleanup_auto_suits.py --apply`
-
-**公告 Queue**
-
-- `scripts/announcement/initialize_announcement_queue.py`：首次部署設定公告起點，既有 raw posts 會標記為 skipped，不發送 Discord，須輸入 `YES`。
-  `python scripts/announcement/initialize_announcement_queue.py`
-- `scripts/announcement/baseline_announcements.py`：人工維運時將明確指定的歷史貼文標記為 skipped jobs；不建立假 announcements，須輸入 `YES`。
-  `python scripts/announcement/baseline_announcements.py --post-url "https://example.invalid/posts/old" --exclude-post-url "https://example.invalid/posts/current"`
-- `scripts/announcement/requeue_announcement.py`：以指定貼文 URL 明確重送一篇公告。
-  `python scripts/announcement/requeue_announcement.py --post-url "https://www.facebook.com/TwNikkiNikki/posts/example"`
-- `scripts/announcement/requeue_latest.py`：重新排入最近一筆已成功送達的公告。
-  `python scripts/announcement/requeue_latest.py`
-
-**一次性／舊版 migration**
-
-- `scripts/announcement/migrations/migrate_announcement_baseline.py`：僅供舊 baseline 資料庫遷移至 announcement jobs；會顯示 `DEPRECATED` 並要求 `YES`。
-  `python scripts/announcement/migrations/migrate_announcement_baseline.py`
-- `scripts/legacy/review_drafts.py`：保留給舊版人工復原用途；日常管理請使用活動與套裝資料卡。
-  `python scripts/legacy/review_drafts.py --help`
-
-**診斷**
-
-- `scripts/diagnostic/facebook_feed_diagnostic.py`：比較 storage state 與專用 persistent profile 的 Facebook Feed。
-  `python scripts/diagnostic/facebook_feed_diagnostic.py --rounds 1`
-- `scripts/diagnostic/facebook_feed_network_diagnostic.py`：記錄 Feed GraphQL response 的 permalink 覆蓋率。
-  `python scripts/diagnostic/facebook_feed_network_diagnostic.py --rounds 1`
-- `scripts/diagnostic/debug_facebook_mobile.py` 與 `scripts/diagnostic/debug_facebook_post_sources.py`：保留的唯讀 Facebook DOM／入口診斷工具；不修改資料庫。
-  `python scripts/diagnostic/debug_facebook_mobile.py --help`
-  `python scripts/diagnostic/debug_facebook_post_sources.py --help`
-
-## 本機敏感資料
-
-`database/database.db`、其 `-wal`／`-shm` 執行期檔案、Facebook storage state/profile，以及登入後產生的 Facebook debug HTML 都只應保留在本機，不應公開分享或提交到 Git。
-
-## 專案結構
-
-```text
-crawler/   資料爬取程式
-database/  資料庫模型與存取層
-bot/       機器人應用程式
-docs/      專案文件
-```
+若需研究或維護這些功能，先閱讀 [docs/legacy_runtime_inventory.md](docs/legacy_runtime_inventory.md) 與對應歷史文件；不要在正式公告 VM 上直接執行 legacy rebuild、reset、crawler 或 repair script。
