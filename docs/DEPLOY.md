@@ -70,12 +70,18 @@ sudo systemctl status miracle-nikki-bot --no-pager
 以 repository 的 `.env.example` 為欄位參考。現役公告同步至少需要：
 
 ```dotenv
+APP_ENV=production
 DISCORD_TOKEN=
+GUILD_ID=
 TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=
 CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=
+ENABLE_ANNOUNCEMENT_PIPELINE=true
 ```
 
+- `APP_ENV`：正式 VM 請填 `production`，僅作環境標記與日誌辨識。
 - `DISCORD_TOKEN`：Discord Bot token。
+- `GUILD_ID`：Production 可留空，保留既有全域 Slash Command 同步；若填寫，僅同步到該 Guild。
+- `ENABLE_ANNOUNCEMENT_PIPELINE`：正式 VM 必須為 `true`，以啟用官方公告輪詢與 Discord delivery。
 - `TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：台服官方公告頻道，可使用逗號分隔多個 ID。
 - `CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：陸服官方公告頻道，可使用逗號分隔多個 ID。
 

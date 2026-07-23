@@ -169,12 +169,18 @@ sudo chmod 600 /opt/miracle-nikki-bot/.env
 現役 pipeline 至少需要：
 
 ```dotenv
+APP_ENV=production
 DISCORD_TOKEN=replace-with-the-real-token-locally
+GUILD_ID=
 TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=111111111111111111
 CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=222222222222222222
+ENABLE_ANNOUNCEMENT_PIPELINE=true
 ```
 
+- `APP_ENV`：正式 VM 請填 `production`，僅作環境標記與日誌辨識。
 - `DISCORD_TOKEN`：Discord Bot token。
+- `GUILD_ID`：Production 可留空，維持既有全域 Slash Command 同步；設定時只會同步到指定 Guild。
+- `ENABLE_ANNOUNCEMENT_PIPELINE`：正式 VM 必須為 `true`，以啟用官方公告輪詢與 Discord delivery。
 - `TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：台服官網公告頻道，可填逗號分隔的多個 ID。
 - `CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：陸服官網公告頻道，可填逗號分隔的多個 ID。
 

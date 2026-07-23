@@ -157,6 +157,7 @@ def test_on_ready_starts_only_official_poll_and_delivery_tasks(monkeypatch):
 
     facebook_task = FakeTask("official-sites")
     delivery_task = FakeTask("v2-delivery")
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", True)
     monkeypatch.setattr(bot_main, "poll_official_announcements", facebook_task)
     monkeypatch.setattr(bot_main, "process_v2_announcement_deliveries", delivery_task)
     monkeypatch.setattr(bot_main, "start_presence_rotation", lambda _bot: None)
@@ -165,6 +166,47 @@ def test_on_ready_starts_only_official_poll_and_delivery_tasks(monkeypatch):
     asyncio.run(bot_main.on_ready())
 
     assert starts == ["official-sites", "v2-delivery"]
+
+
+def test_on_ready_with_disabled_pipeline_keeps_discord_ready_without_starting_tasks(monkeypatch):
+    starts: list[str] = []
+    presence_started: list[object] = []
+
+    class FakeTask:
+        def is_running(self) -> bool:
+            return False
+
+        def start(self) -> None:
+            starts.append("unexpected")
+
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", False)
+    monkeypatch.setattr(bot_main, "poll_official_announcements", FakeTask())
+    monkeypatch.setattr(bot_main, "process_v2_announcement_deliveries", FakeTask())
+    monkeypatch.setattr(bot_main, "start_presence_rotation", lambda bot: presence_started.append(bot))
+
+    asyncio.run(bot_main.on_ready())
+
+    assert presence_started == [bot_main.bot]
+    assert starts == []
+
+
+def test_disabled_pipeline_never_polls_or_claims_deliveries(monkeypatch):
+    calls: list[str] = []
+
+    def state_store_should_not_run() -> None:
+        calls.append("state")
+        raise AssertionError("announcement state must not be used when disabled")
+
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", False)
+    monkeypatch.setattr(bot_main, "AnnouncementStateStore", state_store_should_not_run)
+    monkeypatch.setattr(bot_main, "fetch_tw_official_announcements", lambda _limit: calls.append("tw"))
+    monkeypatch.setattr(bot_main, "fetch_cn_official_announcements", lambda _limit: calls.append("cn"))
+    monkeypatch.setattr(bot_main, "official_initial_poll_complete", asyncio.Event())
+
+    asyncio.run(bot_main.poll_official_announcements.coro())
+    asyncio.run(bot_main.process_v2_announcement_deliveries.coro())
+
+    assert calls == []
 
 
 def test_pending_job_sends_even_when_the_feed_no_longer_returns_the_post(monkeypatch, tmp_path):

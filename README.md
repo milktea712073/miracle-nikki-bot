@@ -109,12 +109,18 @@ python scripts/announcement/replay_latest_official.py --source cn --external-id 
 現役 pipeline 至少使用下列 `.env` 變數：
 
 ```dotenv
+APP_ENV=development
 DISCORD_TOKEN=
+GUILD_ID=
 TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=
 CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=
+ENABLE_ANNOUNCEMENT_PIPELINE=false
 ```
 
+- `APP_ENV`：環境標記；本機建議為 `development`，VM 為 `production`。
 - `DISCORD_TOKEN`：Discord Bot token。
+- `GUILD_ID`：可選；本機測試 Guild ID。設定時 Slash Commands 只同步到該 Guild；Production 可留空。
+- `ENABLE_ANNOUNCEMENT_PIPELINE`：Production 建議為 `true`；本機僅測試 Discord UI 時建議為 `false`，以完全停用公告輪詢與發送。
 - `TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：台服公告目標頻道，可用逗號分隔多個 ID。
 - `CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS`：陸服公告目標頻道，可用逗號分隔多個 ID。
 

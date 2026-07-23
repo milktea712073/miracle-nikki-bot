@@ -37,12 +37,19 @@ python3 -m venv .venv
 以 `.env.example` 為範本建立未追蹤的 `.env`：
 
 ```dotenv
+APP_ENV=development
 DISCORD_TOKEN=TEST_BOT_TOKEN_ONLY
+GUILD_ID=TEST_GUILD_ID
 TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=TEST_TW_CHANNEL_ID
 CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=TEST_CN_CHANNEL_ID
+ENABLE_ANNOUNCEMENT_PIPELINE=false
 ```
 
-只填入測試 token 與測試頻道。不得提交 `.env`、token、channel ID、外部 IP、deploy key、SQLite database 或 backup。
+`GUILD_ID` 設定後，Slash Commands 僅同步到該測試 Guild，不會修改全域指令。Production VM 可留空，維持既有全域同步行為。
+
+本機只測試 Discord UI、Slash Commands、查詢或管理功能時，設定 `ENABLE_ANNOUNCEMENT_PIPELINE=false`。Bot 仍會登入 Discord 並同步指令，但不會初始化公告 state、輪詢官網、建立 delivery 或發送公告。需要驗證公告同步時才改為 `true`。
+
+只填入測試 token、Guild 與測試頻道。不得提交 `.env`、token、Guild／channel ID、外部 IP、deploy key、SQLite database 或 backup。
 
 ## 測試
 

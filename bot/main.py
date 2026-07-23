@@ -91,7 +91,43 @@ def load_channel_ids(env_name: str) -> list[int]:
         for channel_id in os.getenv(env_name, "").split(",")
         if channel_id.strip()
     ]
-    
+
+
+def load_optional_snowflake(env_name: str) -> int | None:
+    """Return an optional Discord snowflake configured in the environment."""
+    value = os.getenv(env_name, "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    raise RuntimeError(f"{env_name} must be a Discord snowflake or left empty.")
+
+
+def load_boolean(env_name: str, default: bool) -> bool:
+    """Read a conventional boolean environment value with a compatible default."""
+    value = os.getenv(env_name, "").strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{env_name} must be true or false when configured.")
+
+
+def load_bounded_integer(env_name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read an integer environment value while preserving Discord API limits."""
+    value = os.getenv(env_name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise RuntimeError(f"{env_name} must be an integer.") from error
+    if not minimum <= parsed <= maximum:
+        raise RuntimeError(f"{env_name} must be between {minimum} and {maximum}.")
+    return parsed
+
 
 
 ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("ANNOUNCEMENT_CHANNEL_IDS")
@@ -102,13 +138,20 @@ TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS = (
 CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS = load_channel_ids("CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS")
 QUERY_CHANNEL_IDS = load_channel_ids("QUERY_CHANNEL_IDS")
 ADMIN_CHANNEL_IDS = load_channel_ids("ADMIN_CHANNEL_IDS")
+APP_ENV = os.getenv("APP_ENV", "production").strip() or "production"
+GUILD_ID = load_optional_snowflake("GUILD_ID")
+DISCORD_COMMAND_PREFIX = os.getenv("DISCORD_COMMAND_PREFIX", "!") or "!"
+DISCORD_MESSAGE_CONTENT_INTENT = load_boolean("DISCORD_MESSAGE_CONTENT_INTENT", default=True)
+ENABLE_ANNOUNCEMENT_PIPELINE = load_boolean("ENABLE_ANNOUNCEMENT_PIPELINE", default=True)
 
 MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE = 3
 FACEBOOK_POLL_INTERVAL_MINUTES = 5
 FACEBOOK_POLL_LIMIT = 10
 OFFICIAL_POLL_INTERVAL_MINUTES = 5
 OFFICIAL_POLL_LIMIT = 10
-DISCORD_EMBEDS_PER_MESSAGE = 10
+DISCORD_EMBEDS_PER_MESSAGE = load_bounded_integer(
+    "DISCORD_EMBEDS_PER_MESSAGE", default=10, minimum=1, maximum=10
+)
 facebook_initial_poll_complete = asyncio.Event()
 tw_initial_poll_complete = asyncio.Event()
 official_initial_poll_complete = asyncio.Event()
@@ -132,18 +175,33 @@ async def require_query_channel(interaction: discord.Interaction) -> bool:
 
 
 class MiracleNikkiBot(commands.Bot):
-    """Discord client that synchronizes its global application commands."""
+    """Discord client that synchronizes globally or to the configured development guild."""
 
     async def setup_hook(self) -> None:
-        await asyncio.to_thread(AnnouncementStateStore)
-        LOGGER.info("v2 announcement state initialized with WAL and a 30-second busy timeout.")
-        synced_commands = await self.tree.sync()
-        LOGGER.info("已同步 %s 個 Slash Commands。", len(synced_commands))
+        if ENABLE_ANNOUNCEMENT_PIPELINE:
+            await asyncio.to_thread(AnnouncementStateStore)
+            LOGGER.info("v2 announcement state initialized with WAL and a 30-second busy timeout.")
+        else:
+            LOGGER.info("[%s] Announcement Pipeline is disabled by ENABLE_ANNOUNCEMENT_PIPELINE.", APP_ENV)
+        if GUILD_ID is None:
+            synced_commands = await self.tree.sync()
+            LOGGER.info("[%s] 已全域同步 %s 個 Slash Commands。", APP_ENV, len(synced_commands))
+            return
+
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        synced_commands = await self.tree.sync(guild=guild)
+        LOGGER.info(
+            "[%s] 已同步 %s 個 Slash Commands 至 Guild %s。",
+            APP_ENV,
+            len(synced_commands),
+            GUILD_ID,
+        )
 
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = MiracleNikkiBot(command_prefix="!", intents=intents)
+intents.message_content = DISCORD_MESSAGE_CONTENT_INTENT
+bot = MiracleNikkiBot(command_prefix=DISCORD_COMMAND_PREFIX, intents=intents)
 
 
 def create_embed(post: dict[str, object]) -> discord.Embed:
@@ -495,6 +553,9 @@ bot.tree.remove_command("套裝")
 async def on_ready() -> None:
     start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
+    if not ENABLE_ANNOUNCEMENT_PIPELINE:
+        LOGGER.info("[%s] Official announcement polling and delivery are disabled.", APP_ENV)
+        return
     if not poll_official_announcements.is_running():
         poll_official_announcements.start()
     if not process_v2_announcement_deliveries.is_running():
@@ -504,6 +565,10 @@ async def on_ready() -> None:
 @tasks.loop(minutes=OFFICIAL_POLL_INTERVAL_MINUTES)
 async def poll_official_announcements() -> None:
     """Poll official Taiwan and China sources into v2 state, without legacy storage."""
+    if not ENABLE_ANNOUNCEMENT_PIPELINE:
+        LOGGER.info("Official announcement poll skipped because the pipeline is disabled.")
+        official_initial_poll_complete.set()
+        return
     state = AnnouncementStateStore()
     sources = (
         ("TW official", TW_OFFICIAL, fetch_tw_official_announcements, TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS),
@@ -586,6 +651,9 @@ async def poll_tw_announcements() -> None:
 async def process_v2_announcement_deliveries() -> None:
     """Deliver only persisted official-site announcements through the existing dispatcher."""
     global v2_delivery_recovered
+    if not ENABLE_ANNOUNCEMENT_PIPELINE:
+        LOGGER.info("Official announcement delivery skipped because the pipeline is disabled.")
+        return
     await official_initial_poll_complete.wait()
     state = AnnouncementStateStore()
     if not v2_delivery_recovered:
