@@ -10,7 +10,16 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlsplit
 
-from announcement.models import Announcement, TW_FACEBOOK_SOURCE, canonical_announcement_url
+from announcement.models import (
+    Announcement,
+    CN_OFFICIAL,
+    TW_FACEBOOK_SOURCE,
+    TW_OFFICIAL,
+    canonical_announcement_url,
+)
+from announcement.history_archive import initialize_history_tables
+from announcement.search import keyword_search_variants
+from announcement.search_models import AnnouncementSearchPage, AnnouncementSearchResult
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +28,17 @@ DEFAULT_STATE_DATABASE_PATH = PROJECT_ROOT / "database" / "announcement_state.db
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _load_image_urls(value: object) -> tuple[str, ...]:
+    """Return stored announcement image URLs without letting malformed JSON break search."""
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(url.strip() for url in parsed if isinstance(url, str) and url.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +58,10 @@ class LegacyInitializationPlan:
 class AnnouncementStateStore:
     """Persist only announcement delivery and future reminder state."""
 
-    def __init__(self, database_path: Path | None = None) -> None:
+    def __init__(self, database_path: Path | None = None, *, initialize: bool = True) -> None:
         self.database_path = database_path or DEFAULT_STATE_DATABASE_PATH
-        self.initialize()
+        if initialize:
+            self.initialize()
 
     def _connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,6 +140,7 @@ class AnnouncementStateStore:
                 column_name = column_sql.split()[0]
                 if column_name not in columns:
                     connection.execute(f"ALTER TABLE announcements ADD COLUMN {column_sql}")
+            initialize_history_tables(connection)
             connection.commit()
         finally:
             connection.close()
@@ -150,6 +172,73 @@ class AnnouncementStateStore:
             connection.commit()
         finally:
             connection.close()
+
+    def search_announcements(
+        self,
+        keyword: str,
+        *,
+        source: str | None = None,
+        limit: int = 10,
+    ) -> AnnouncementSearchPage:
+        """Search title and body with literal Traditional/Simplified keyword variants."""
+        normalized_keyword = keyword.strip()
+        if not normalized_keyword:
+            raise ValueError("keyword must not be blank")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+
+        match_clauses: list[str] = []
+        parameters: list[object] = []
+        for variant in keyword_search_variants(normalized_keyword):
+            escaped_variant = variant.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            match_clauses.append("(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')")
+            parameters.extend((f"%{escaped_variant}%", f"%{escaped_variant}%"))
+        where_clauses = [f"({' OR '.join(match_clauses)})"]
+        if source == TW_OFFICIAL:
+            where_clauses.append("source IN (?, ?)")
+            parameters.extend((TW_OFFICIAL, TW_FACEBOOK_SOURCE))
+        elif source is not None:
+            where_clauses.append("source = ?")
+            parameters.append(source)
+        else:
+            where_clauses.append("source IN (?, ?, ?)")
+            parameters.extend((TW_OFFICIAL, CN_OFFICIAL, TW_FACEBOOK_SOURCE))
+        parameters.append(limit + 1)
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT id, source, external_id, title, canonical_url, published_at, content, image_urls_json
+                FROM announcements
+                WHERE {' AND '.join(where_clauses)}
+                ORDER BY published_at IS NULL ASC, published_at DESC, id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        finally:
+            connection.close()
+
+        has_more = len(rows) > limit
+        return AnnouncementSearchPage(
+            results=tuple(
+                AnnouncementSearchResult(
+                    source_kind="announcement",
+                    source_record_id=int(row[0]),
+                    source=str(row[1]),
+                    region=("cn" if str(row[1]) == CN_OFFICIAL else "tw"),
+                    external_id=str(row[2]),
+                    title=str(row[3]),
+                    canonical_url=str(row[4]),
+                    published_at=str(row[5]) if row[5] is not None else None,
+                    content_text=str(row[6]),
+                    image_urls=_load_image_urls(row[7]),
+                )
+                for row in rows[:limit]
+            ),
+            has_more=has_more,
+        )
 
     def register(
         self,

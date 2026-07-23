@@ -24,9 +24,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from announcement.dispatcher import dispatch_delivery
+from announcement.history_search import AnnouncementHistorySearchService
 from announcement.models import Announcement, CN_OFFICIAL, TW_OFFICIAL
 from announcement.state_store import AnnouncementStateStore
 from bot.admin.checks import is_administrator, is_administrator_channel
+from bot.announcement_search_view import build_announcement_message_payloads
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
@@ -152,6 +154,12 @@ OFFICIAL_POLL_LIMIT = 10
 DISCORD_EMBEDS_PER_MESSAGE = load_bounded_integer(
     "DISCORD_EMBEDS_PER_MESSAGE", default=10, minimum=1, maximum=10
 )
+ANNOUNCEMENT_SEARCH_LIMIT = 10
+ANNOUNCEMENT_SEARCH_SOURCES = {
+    "all": None,
+    "tw": TW_OFFICIAL,
+    "cn": CN_OFFICIAL,
+}
 facebook_initial_poll_complete = asyncio.Event()
 tw_initial_poll_complete = asyncio.Event()
 official_initial_poll_complete = asyncio.Event()
@@ -471,6 +479,98 @@ async def suit_name_autocomplete(
         LOGGER.exception("讀取套裝名稱提示失敗。")
         return []
     return [app_commands.Choice(name=name, value=name) for name in names]
+
+
+@bot.tree.command(name="公告搜尋", description="搜尋已保存的台服與陸服官方公告")
+@app_commands.rename(keyword="關鍵字", source="公告來源")
+@app_commands.describe(keyword="搜尋公告標題與正文", source="選擇全部、台服或陸服公告")
+@app_commands.choices(
+    source=[
+        app_commands.Choice(name="全部", value="all"),
+        app_commands.Choice(name="台服", value="tw"),
+        app_commands.Choice(name="陸服", value="cn"),
+    ]
+)
+async def announcement_search_command(
+    interaction: discord.Interaction,
+    keyword: str,
+    source: str = "all",
+) -> None:
+    """Search persisted official notices without invoking the announcement pipeline."""
+    try:
+        await interaction.response.defer(thinking=True)
+    except Exception:
+        LOGGER.exception("Unable to acknowledge announcement search interaction.")
+        return
+    if not is_query_channel(interaction.channel_id):
+        await interaction.followup.send("請到指定的查詢頻道使用此指令。", ephemeral=True)
+        return
+    normalized_keyword = keyword.strip()
+    if not normalized_keyword:
+        await interaction.followup.send("請輸入公告搜尋關鍵字。", ephemeral=True)
+        return
+    source_filter = ANNOUNCEMENT_SEARCH_SOURCES.get(source)
+    if source not in ANNOUNCEMENT_SEARCH_SOURCES:
+        await interaction.followup.send("請選擇有效的公告伺服器篩選條件。", ephemeral=True)
+        return
+
+    try:
+        search_page = await asyncio.to_thread(
+            AnnouncementHistorySearchService().search,
+            normalized_keyword,
+            source=source_filter,
+            limit=ANNOUNCEMENT_SEARCH_LIMIT,
+        )
+    except Exception:
+        LOGGER.exception("公告搜尋失敗 keyword=%r source=%r", normalized_keyword, source)
+        await interaction.followup.send("公告搜尋時發生錯誤，請稍後再試。", ephemeral=True)
+        return
+
+    if not search_page.results:
+        await interaction.followup.send(
+            f"找不到包含「{normalized_keyword}」的公告。",
+            ephemeral=True,
+        )
+        return
+    for result_index, result in enumerate(search_page.results):
+        payload_index: int | None = None
+        embed_count: int | None = None
+        try:
+            payloads = build_announcement_message_payloads(
+                result,
+                owner_user_id=interaction.user.id,
+            )
+            for payload_index, payload in enumerate(payloads):
+                embed_count = len(payload.embeds)
+                send_kwargs: dict[str, object] = {
+                    "embeds": payload.embeds,
+                    "wait": True,
+                }
+                if payload.view is not None:
+                    send_kwargs["view"] = payload.view
+                message = await interaction.followup.send(**send_kwargs)
+                if payload.view is not None:
+                    payload.view.message = message
+        except Exception:
+            LOGGER.exception(
+                "Announcement-search rendering failed keyword=%r source_filter=%r "
+                "result_index=%d source_kind=%s notice_source=%s external_id=%s "
+                "record_id=%s payload_index=%s embed_count=%s",
+                normalized_keyword,
+                source,
+                result_index,
+                result.source_kind,
+                result.source,
+                result.external_id,
+                result.source_record_id,
+                payload_index,
+                embed_count,
+            )
+            try:
+                await interaction.followup.send("公告搜尋結果呈現失敗，請稍後再試。", ephemeral=True)
+            except Exception:
+                LOGGER.exception("Unable to report announcement-search rendering failure.")
+            return
 
 
 @bot.tree.command(name="活動", description="查詢已確認匯入的活動資料")
