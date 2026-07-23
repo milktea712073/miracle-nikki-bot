@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import discord
@@ -27,6 +28,89 @@ class AnnouncementMessagePayload:
 
     embeds: list[discord.Embed]
     view: AnnouncementImageView | None = None
+
+
+def _result_title(result: AnnouncementSearchResult, limit: int = 100) -> str:
+    return _truncate(result.title.strip() or "未命名公告", limit)
+
+
+def _result_source_label(result: AnnouncementSearchResult) -> str:
+    return REGION_LABELS.get(result.region, result.source)
+
+
+def _result_date_label(result: AnnouncementSearchResult) -> str:
+    if not result.published_at:
+        return "日期未提供"
+    return result.published_at[:10].replace("-", "/")
+
+
+def highlight_search_terms(
+    text: str,
+    keyword: str,
+    matched_terms: Iterable[str],
+) -> str:
+    """Add Discord bold markers to literal matched terms without touching protected Markdown."""
+    terms: list[str] = []
+    for candidate in (keyword, *matched_terms):
+        normalized = candidate.strip()
+        if normalized and normalized not in terms:
+            terms.append(normalized)
+    if not text or not terms:
+        return text
+
+    # Existing bold spans and URLs must remain byte-for-byte intact.  Inline
+    # code is protected as well because Markdown inside it is literal content.
+    protected_pattern = re.compile(r"(\*\*.*?\*\*|`[^`]*`|https?://[^\s]+)", re.DOTALL)
+    term_pattern = re.compile(
+        "(" + "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True)) + ")",
+        re.IGNORECASE,
+    )
+    parts: list[str] = []
+    cursor = 0
+    for protected in protected_pattern.finditer(text):
+        parts.append(term_pattern.sub(r"**\1**", text[cursor : protected.start()]))
+        parts.append(protected.group(0))
+        cursor = protected.end()
+    parts.append(term_pattern.sub(r"**\1**", text[cursor:]))
+    return "".join(parts)
+
+
+def build_search_results_embed(
+    results: tuple[AnnouncementSearchResult, ...], *, keyword: str
+) -> discord.Embed:
+    """Build the compact public result list for a multi-result search."""
+    lines = [f"關鍵字：{keyword}", ""]
+    for index, result in enumerate(results, start=1):
+        lines.append(f"{index}. {_result_title(result, 180)}")
+        lines.append(f"   {_result_date_label(result)}｜{_result_source_label(result)}")
+        lines.append("")
+    lines.append("請從下方選擇要查看的公告。")
+    return discord.Embed(
+        title=f"🔎 找到 {len(results)} 筆公告",
+        description="\n".join(lines)[:MAX_EMBED_DESCRIPTION_LENGTH],
+        color=discord.Color.from_rgb(255, 183, 197),
+    )
+
+
+async def send_announcement_payloads(
+    interaction: discord.Interaction,
+    payloads: list[AnnouncementMessagePayload],
+    *,
+    ephemeral: bool,
+) -> list[discord.Message | discord.WebhookMessage | None]:
+    """Send complete-notice payloads without passing ``view=None`` to discord.py."""
+    messages: list[discord.Message | discord.WebhookMessage | None] = []
+    for payload in payloads:
+        send_kwargs: dict[str, object] = {"embeds": payload.embeds, "wait": True}
+        if ephemeral:
+            send_kwargs["ephemeral"] = True
+        if payload.view is not None:
+            send_kwargs["view"] = payload.view
+        message = await interaction.followup.send(**send_kwargs)
+        if payload.view is not None and message is not None:
+            payload.view.message = message
+        messages.append(message)
+    return messages
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -179,13 +263,121 @@ class AnnouncementImageView(discord.ui.View):
             LOGGER.exception("Failed to disable timed-out announcement-search image controls.")
 
 
-def build_announcement_message_payloads(result: AnnouncementSearchResult, *, owner_user_id: int) -> list[AnnouncementMessagePayload]:
+class AnnouncementSearchResultSelect(discord.ui.Select):
+    """Select one compact search-list entry and reveal its complete notice privately."""
+
+    def __init__(self, parent: AnnouncementSearchResultView) -> None:
+        self.parent_view = parent
+        options = [
+            discord.SelectOption(
+                label=_result_title(result),
+                description=_truncate(
+                    f"{_result_date_label(result)}｜{_result_source_label(result)}", 100
+                ),
+                value=str(index),
+            )
+            for index, result in enumerate(parent.results)
+        ]
+        super().__init__(placeholder="選擇公告", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        selected_index = int(self.values[0])
+        result = self.parent_view.results[selected_index]
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            payloads = build_announcement_message_payloads(
+                result,
+                owner_user_id=self.parent_view.owner_user_id,
+                highlight_terms=self.parent_view.highlight_terms,
+            )
+            await send_announcement_payloads(interaction, payloads, ephemeral=True)
+        except Exception:
+            LOGGER.exception(
+                "Announcement-search selection rendering failed keyword=%r source_filter=%r "
+                "owner_user_id=%s selected_index=%s source_kind=%s notice_source=%s "
+                "external_id=%s record_id=%s",
+                self.parent_view.keyword,
+                self.parent_view.source_filter,
+                self.parent_view.owner_user_id,
+                selected_index,
+                result.source_kind,
+                result.source,
+                result.external_id,
+                result.source_record_id,
+            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("公告內容顯示失敗，請稍後再試。", ephemeral=True)
+                else:
+                    await interaction.response.send_message("公告內容顯示失敗，請稍後再試。", ephemeral=True)
+            except Exception:
+                LOGGER.exception("Unable to report announcement-search selection rendering failure.")
+
+
+class AnnouncementSearchResultView(discord.ui.View):
+    """Public compact search list with an owner-bound result selector."""
+
+    def __init__(
+        self,
+        *,
+        results: tuple[AnnouncementSearchResult, ...],
+        owner_user_id: int,
+        keyword: str,
+        source_filter: str,
+        highlight_terms: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(timeout=SEARCH_VIEW_TIMEOUT_SECONDS)
+        self.results = results
+        self.owner_user_id = owner_user_id
+        self.keyword = keyword
+        self.source_filter = source_filter
+        self.highlight_terms = highlight_terms
+        self.message: discord.Message | discord.WebhookMessage | None = None
+        self.add_item(AnnouncementSearchResultSelect(self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+        try:
+            await interaction.response.send_message(
+                "這不是你的搜尋結果，請自行使用 /公告搜尋。",
+                ephemeral=True,
+            )
+        except Exception:
+            LOGGER.exception("Unable to reject another user's announcement-search selection.")
+        return False
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            LOGGER.exception("Failed to disable timed-out announcement-search result selector.")
+
+
+def build_announcement_message_payloads(
+    result: AnnouncementSearchResult,
+    *,
+    owner_user_id: int,
+    highlight_terms: tuple[str, ...] = (),
+) -> list[AnnouncementMessagePayload]:
     """Render one complete announcement into one or more Discord-safe messages."""
     source = REGION_LABELS.get(result.region, result.source)
     header = f"**{source}｜{_format_date(result.published_at)}**\n\n🔗 [查看官方公告]({result.canonical_url})"
     first_chunk_limit = max(1, min(BODY_CHUNK_LENGTH, MAX_EMBED_DESCRIPTION_LENGTH - len(header) - 2))
-    content_chunks = split_announcement_content(result.content_text, maximum=first_chunk_limit) or ["（公告未提供正文）"]
-    embeds = [discord.Embed(title=_truncate(result.title or "未命名公告", MAX_EMBED_TITLE_LENGTH), description=f"{header}\n\n{content_chunks[0]}", color=discord.Color.from_rgb(255, 183, 197))]
+    highlighted_content = highlight_search_terms(result.content_text, "", highlight_terms)
+    content_chunks = split_announcement_content(highlighted_content, maximum=first_chunk_limit) or ["（公告未提供正文）"]
+    display_title = highlight_search_terms(
+        _truncate(result.title or "未命名公告", MAX_EMBED_TITLE_LENGTH),
+        "",
+        highlight_terms,
+    )
+    embeds = [discord.Embed(title=display_title, description=f"{header}\n\n{content_chunks[0]}", color=discord.Color.from_rgb(255, 183, 197))]
     total_chunks = len(content_chunks)
     for index, chunk in enumerate(content_chunks[1:], start=2):
         embeds.append(discord.Embed(title=f"公告內容 {index} / {total_chunks}", description=chunk, color=discord.Color.from_rgb(255, 183, 197)))

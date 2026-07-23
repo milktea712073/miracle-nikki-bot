@@ -26,9 +26,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from announcement.dispatcher import dispatch_delivery
 from announcement.history_search import AnnouncementHistorySearchService
 from announcement.models import Announcement, CN_OFFICIAL, TW_OFFICIAL
+from announcement.search import keyword_search_variants
 from announcement.state_store import AnnouncementStateStore
 from bot.admin.checks import is_administrator, is_administrator_channel
-from bot.announcement_search_view import build_announcement_message_payloads
+from bot.announcement_search_view import (
+    AnnouncementSearchResultView,
+    build_announcement_message_payloads,
+    build_search_results_embed,
+    send_announcement_payloads,
+)
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
@@ -532,45 +538,58 @@ async def announcement_search_command(
             ephemeral=True,
         )
         return
-    for result_index, result in enumerate(search_page.results):
-        payload_index: int | None = None
-        embed_count: int | None = None
+    highlight_terms = keyword_search_variants(normalized_keyword)
+    if len(search_page.results) == 1:
+        result = search_page.results[0]
         try:
             payloads = build_announcement_message_payloads(
                 result,
                 owner_user_id=interaction.user.id,
+                highlight_terms=highlight_terms,
             )
-            for payload_index, payload in enumerate(payloads):
-                embed_count = len(payload.embeds)
-                send_kwargs: dict[str, object] = {
-                    "embeds": payload.embeds,
-                    "wait": True,
-                }
-                if payload.view is not None:
-                    send_kwargs["view"] = payload.view
-                message = await interaction.followup.send(**send_kwargs)
-                if payload.view is not None:
-                    payload.view.message = message
+            await send_announcement_payloads(interaction, payloads, ephemeral=False)
         except Exception:
             LOGGER.exception(
-                "Announcement-search rendering failed keyword=%r source_filter=%r "
-                "result_index=%d source_kind=%s notice_source=%s external_id=%s "
-                "record_id=%s payload_index=%s embed_count=%s",
+                "Announcement-search single-result rendering failed keyword=%r source_filter=%r "
+                "source_kind=%s notice_source=%s external_id=%s record_id=%s",
                 normalized_keyword,
                 source,
-                result_index,
                 result.source_kind,
                 result.source,
                 result.external_id,
                 result.source_record_id,
-                payload_index,
-                embed_count,
             )
             try:
                 await interaction.followup.send("公告搜尋結果呈現失敗，請稍後再試。", ephemeral=True)
             except Exception:
                 LOGGER.exception("Unable to report announcement-search rendering failure.")
-            return
+        return
+
+    view = AnnouncementSearchResultView(
+        results=search_page.results,
+        owner_user_id=interaction.user.id,
+        keyword=normalized_keyword,
+        source_filter=source,
+        highlight_terms=highlight_terms,
+    )
+    try:
+        message = await interaction.followup.send(
+            embed=build_search_results_embed(search_page.results, keyword=normalized_keyword),
+            view=view,
+            wait=True,
+        )
+        view.message = message
+    except Exception:
+        LOGGER.exception(
+            "Announcement-search result-list rendering failed keyword=%r source_filter=%r result_count=%d",
+            normalized_keyword,
+            source,
+            len(search_page.results),
+        )
+        try:
+            await interaction.followup.send("公告搜尋結果呈現失敗，請稍後再試。", ephemeral=True)
+        except Exception:
+            LOGGER.exception("Unable to report announcement-search result-list rendering failure.")
 
 
 @bot.tree.command(name="活動", description="查詢已確認匯入的活動資料")

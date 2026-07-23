@@ -393,10 +393,12 @@ def test_search_command_works_when_announcement_pipeline_is_disabled(monkeypatch
     asyncio.run(bot_main.announcement_search_command.callback(interaction, "福袋", "all"))
 
     assert interaction.response.deferred is True
-    assert len(interaction.followup.messages) == 4
+    assert len(interaction.followup.messages) == 1
     payload = interaction.followup.messages[0][1]
-    assert payload["embeds"][0].image.url is None
-    assert "view" not in payload
+    assert "embed" in payload
+    assert "view" in payload
+    assert "找到 4 筆公告" in payload["embed"].title
+    assert payload["embed"].image.url is None
 
 
 def test_search_command_exposes_fixed_announcement_source_choices() -> None:
@@ -474,7 +476,7 @@ def test_search_command_returns_matching_archived_raw_post(monkeypatch, tmp_path
 
     assert interaction.response.deferred is True
     assert len(interaction.followup.messages) == 1
-    assert "小屋願之庭限時開放。" in interaction.followup.messages[0][1]["embeds"][0].description
+    assert "小屋**願之庭**限時開放。" in interaction.followup.messages[0][1]["embeds"][0].description
 
 
 def test_search_command_reports_no_results(monkeypatch, tmp_path: Path) -> None:
@@ -530,7 +532,7 @@ def test_search_command_logs_and_reports_rendering_error(monkeypatch, tmp_path: 
     asyncio.run(bot_main.announcement_search_command.callback(interaction, "福袋", "all"))
 
     assert interaction.response.deferred is True
-    assert "Announcement-search rendering failed" in caplog.text
+    assert "Announcement-search result-list rendering failed" in caplog.text
     assert "RuntimeError: render failed" in caplog.text
     assert interaction.followup.messages == [
         (("公告搜尋結果呈現失敗，請稍後再試。",), {"ephemeral": True})
@@ -565,7 +567,8 @@ def test_search_command_renders_known_historical_keywords_without_processing_err
     assert interaction.response.deferred is True
     assert len(interaction.followup.messages) == 1
     embeds = interaction.followup.messages[0][1]["embeds"]
-    assert embeds[0].title == f"{keyword} 公告"
+    assert embeds[0].title == f"**{keyword}** 公告"
+    assert f"**{keyword}** 的完整歷史公告正文。" in embeds[0].description
     assert "view" not in interaction.followup.messages[0][1]
     assert all(
         args != ("公告搜尋結果呈現失敗，請稍後再試。",)

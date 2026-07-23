@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 
+import bot.announcement_search_view as search_view
 from announcement.search_models import AnnouncementSearchResult
 from bot.announcement_search_view import (
     AnnouncementImageView,
+    AnnouncementSearchResultView,
     SEARCH_VIEW_TIMEOUT_SECONDS,
     build_announcement_message_payloads,
+    build_search_results_embed,
+    highlight_search_terms,
     split_announcement_content,
 )
 
@@ -70,6 +75,43 @@ class FakeMessage:
         self.edits.append(kwargs)
 
 
+class FakeSelectionResponse:
+    def __init__(self) -> None:
+        self.deferred = False
+        self.done = False
+        self.messages: list[tuple[str, dict[str, object]]] = []
+
+    async def defer(self, **_kwargs: object) -> None:
+        self.deferred = True
+        self.done = True
+
+    async def send_message(self, content: str, **kwargs: object) -> None:
+        self.done = True
+        self.messages.append((content, kwargs))
+
+    def is_done(self) -> bool:
+        return self.done
+
+
+class FakeSelectionFollowup:
+    def __init__(self) -> None:
+        self.messages: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.sent_messages: list[object] = []
+
+    async def send(self, *args: object, **kwargs: object) -> object:
+        self.messages.append((args, kwargs))
+        message = SimpleNamespace()
+        self.sent_messages.append(message)
+        return message
+
+
+class FakeSelectionInteraction:
+    def __init__(self, user_id: int = 1) -> None:
+        self.user = SimpleNamespace(id=user_id)
+        self.response = FakeSelectionResponse()
+        self.followup = FakeSelectionFollowup()
+
+
 def test_short_notice_is_complete_in_one_message_without_notice_pagination() -> None:
     payloads = build_announcement_message_payloads(make_result(1), owner_user_id=1)
 
@@ -78,6 +120,52 @@ def test_short_notice_is_complete_in_one_message_without_notice_pagination() -> 
     assert "First paragraph.\n\nSecond paragraph." in payloads[0].embeds[0].description
     assert payloads[0].view is None
     assert all("公告 X / N" not in (embed.footer.text or "") for embed in payloads[0].embeds)
+
+
+def test_highlight_search_terms_marks_single_and_repeated_matches() -> None:
+    assert highlight_search_terms("願之庭 假日露營地，願之庭復刻。", "願之庭", ("願之庭",)) == (
+        "**願之庭** 假日露營地，**願之庭**復刻。"
+    )
+
+
+def test_highlight_search_terms_marks_traditional_and_simplified_variants() -> None:
+    assert highlight_search_terms("願之庭與愿之庭皆可命中。", "願之庭", ("願之庭", "愿之庭")) == (
+        "**願之庭**與**愿之庭**皆可命中。"
+    )
+
+
+def test_highlight_search_terms_preserves_existing_bold_and_urls() -> None:
+    text = "**願之庭** https://example.test/願之庭?query=願之庭 願之庭"
+
+    assert highlight_search_terms(text, "願之庭", ("願之庭",)) == (
+        "**願之庭** https://example.test/願之庭?query=願之庭 **願之庭**"
+    )
+
+
+def test_highlight_search_terms_leaves_unmatched_text_unchanged() -> None:
+    text = "沒有任何命中的公告內容。\n保留原本換行與標點！"
+
+    assert highlight_search_terms(text, "願之庭", ("願之庭", "愿之庭")) == text
+
+
+def test_complete_payload_highlights_title_and_content_without_changing_links() -> None:
+    result = make_result(
+        1,
+        content="願之庭資訊：https://example.test/願之庭\n愿之庭也會命中。",
+    )
+    result = replace(result, title="願之庭公告")
+
+    payload = build_announcement_message_payloads(
+        result,
+        owner_user_id=1,
+        highlight_terms=("願之庭", "愿之庭"),
+    )[0]
+
+    assert payload.embeds[0].title == "**願之庭**公告"
+    assert "**願之庭**資訊" in payload.embeds[0].description
+    assert "https://example.test/願之庭" in payload.embeds[0].description
+    assert "https://example.test/**願之庭**" not in payload.embeds[0].description
+    assert "**愿之庭**也會命中。" in payload.embeds[0].description
 
 
 def test_three_results_produce_three_independent_notice_messages() -> None:
@@ -198,3 +286,141 @@ def test_raw_and_active_results_share_the_complete_renderer() -> None:
     assert "Active body." in active_payload.embeds[0].description
     assert "台服" in raw_payload.embeds[0].description
     assert "陸服" in active_payload.embeds[0].description
+
+
+def test_result_list_uses_safe_select_options_and_compact_public_embed() -> None:
+    results = (
+        make_result(1),
+        make_result(2, region="cn", source="cn_official"),
+    )
+    embed = build_search_results_embed(results, keyword="願之庭")
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="願之庭",
+        source_filter="all",
+    )
+    select = view.children[0]
+
+    assert "找到 2 筆公告" in embed.title
+    assert "願之庭" in embed.description
+    assert "First paragraph" not in embed.description
+    assert select.placeholder == "選擇公告"
+    assert len(select.options) == 2
+    assert [option.value for option in select.options] == ["0", "1"]
+    assert all(len(option.label) <= 100 for option in select.options)
+    assert all(len(option.description or "") <= 100 for option in select.options)
+
+
+def test_result_select_sends_selected_complete_notice_ephemerally() -> None:
+    results = (
+        make_result(1),
+        make_result(2, content="第二篇完整公告。"),
+    )
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="海歌",
+        source_filter="all",
+    )
+    select = view.children[0]
+    select._values = ["1"]
+    interaction = FakeSelectionInteraction()
+
+    asyncio.run(select.callback(interaction))
+
+    assert interaction.response.deferred is True
+    assert len(interaction.followup.messages) == 1
+    send_kwargs = interaction.followup.messages[0][1]
+    assert send_kwargs["ephemeral"] is True
+    assert "第二篇完整公告。" in send_kwargs["embeds"][0].description
+    assert "view" not in send_kwargs
+
+
+def test_result_select_uses_and_binds_image_view_only_for_multiple_images() -> None:
+    results = (
+        make_result(1),
+        make_result(2, images=("https://images.example/one.png", "https://images.example/two.png")),
+    )
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="永夜",
+        source_filter="all",
+    )
+    select = view.children[0]
+    select._values = ["1"]
+    interaction = FakeSelectionInteraction()
+
+    asyncio.run(select.callback(interaction))
+
+    send_kwargs = interaction.followup.messages[0][1]
+    assert send_kwargs["ephemeral"] is True
+    assert isinstance(send_kwargs["view"], AnnouncementImageView)
+    assert send_kwargs["view"].message is interaction.followup.sent_messages[0]
+
+
+def test_result_select_allows_repeated_choices_without_modifying_public_list() -> None:
+    results = (make_result(1, content="第一篇。"), make_result(2, content="第二篇。"))
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="願之庭",
+        source_filter="all",
+    )
+    select = view.children[0]
+    first_interaction = FakeSelectionInteraction()
+    second_interaction = FakeSelectionInteraction()
+
+    select._values = ["0"]
+    asyncio.run(select.callback(first_interaction))
+    select._values = ["1"]
+    asyncio.run(select.callback(second_interaction))
+
+    assert "第一篇。" in first_interaction.followup.messages[0][1]["embeds"][0].description
+    assert "第二篇。" in second_interaction.followup.messages[0][1]["embeds"][0].description
+    assert select.disabled is False
+
+
+def test_result_select_logs_and_reports_payload_failure(monkeypatch, caplog) -> None:
+    view = AnnouncementSearchResultView(
+        results=(make_result(1), make_result(2)),
+        owner_user_id=1,
+        keyword="海歌",
+        source_filter="all",
+    )
+    select = view.children[0]
+    select._values = ["1"]
+    interaction = FakeSelectionInteraction()
+
+    def fail_payloads(*_args: object, **_kwargs: object) -> list[object]:
+        raise RuntimeError("payload failed")
+
+    monkeypatch.setattr(search_view, "build_announcement_message_payloads", fail_payloads)
+    asyncio.run(select.callback(interaction))
+
+    assert "Announcement-search selection rendering failed" in caplog.text
+    assert "RuntimeError: payload failed" in caplog.text
+    assert interaction.followup.messages == [
+        (("公告內容顯示失敗，請稍後再試。",), {"ephemeral": True})
+    ]
+
+
+def test_result_list_rejects_non_owner_and_disables_select_after_timeout() -> None:
+    view = AnnouncementSearchResultView(
+        results=(make_result(1), make_result(2)),
+        owner_user_id=1,
+        keyword="願之庭",
+        source_filter="all",
+    )
+    other = FakeSelectionInteraction(user_id=2)
+
+    assert asyncio.run(view.interaction_check(other)) is False
+    assert other.response.messages == [
+        ("這不是你的搜尋結果，請自行使用 /公告搜尋。", {"ephemeral": True})
+    ]
+    message = FakeMessage()
+    view.message = message
+    asyncio.run(view.on_timeout())
+    assert all(item.disabled for item in view.children)
+    assert message.edits[-1]["view"] is view
