@@ -23,6 +23,7 @@ RAW_SOURCE_REGIONS = {
     "joybomb_archive": TW_REGION,
     "website": TW_REGION,
     "tw_official": TW_REGION,
+    "tw_fearless_official": TW_REGION,
     "cn_official": CN_REGION,
     "cn_website": CN_REGION,
 }

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Mapping
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from crawler.models import Post
@@ -46,6 +47,7 @@ class Announcement:
     content_html: str | None
     content_text: str
     images: tuple[str, ...]
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def canonical_url(self) -> str:
