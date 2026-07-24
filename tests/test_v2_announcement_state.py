@@ -164,6 +164,7 @@ def test_official_poller_registers_each_source_once_without_legacy_database(monk
         category="公告", published_at=None, content_html="<p>CN</p>", content_text="CN", images=(),
     )
     monkeypatch.setattr(bot_main, "AnnouncementStateStore", lambda: store)
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", True)
     monkeypatch.setattr(bot_main, "fetch_tw_official_announcements", lambda _limit: [tw])
     monkeypatch.setattr(bot_main, "fetch_cn_official_announcements", lambda _limit: [cn])
     monkeypatch.setattr(bot_main, "TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS", [101])
@@ -191,6 +192,7 @@ def test_official_poller_without_baseline_does_not_enqueue_current_notices(monke
         category="活動", published_at=None, content_html=None, content_text="TW", images=(),
     )
     monkeypatch.setattr(bot_main, "AnnouncementStateStore", lambda: store)
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", True)
     monkeypatch.setattr(bot_main, "fetch_tw_official_announcements", lambda _limit: [announcement])
     monkeypatch.setattr(bot_main, "fetch_cn_official_announcements", lambda _limit: [])
     monkeypatch.setattr(bot_main, "TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS", [101])
@@ -213,6 +215,7 @@ def test_v2_worker_marks_each_channel_only_after_that_channel_succeeds(monkeypat
         [101, 102],
     )
     monkeypatch.setattr(bot_main, "AnnouncementStateStore", lambda: store)
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", True)
     monkeypatch.setattr(bot_main, "TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS", [101, 102])
     monkeypatch.setattr(bot_main, "CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS", [])
     monkeypatch.setattr(bot_main, "official_initial_poll_complete", asyncio.Event())

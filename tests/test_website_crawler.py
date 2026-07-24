@@ -46,6 +46,34 @@ def test_extract_content_preserves_text_and_image_dom_order() -> None:
     assert images == ["1.jpg", "2.jpg", "3.jpg"]
 
 
+def test_extract_content_supports_lazy_images_and_ignores_page_chrome() -> None:
+    text, images = website_crawler.extract_content(
+        '<p>正文<img data-src="https://image/lazy.jpg"></p>'
+        '<footer>固定頁尾<img src="https://image/footer.jpg"></footer>'
+        '<img class="site-logo" src="https://image/logo.jpg">'
+    )
+    assert text == "正文"
+    assert images == ["https://image/lazy.jpg"]
+
+
+def test_fetch_news_page_preserves_api_total_and_offset() -> None:
+    requested: list[str] = []
+
+    page = website_crawler.fetch_news_page(
+        offset=50,
+        limit=10,
+        json_fetcher=lambda url: (
+            requested.append(url)
+            or {"ret": 0, "data": {"total": 62, "data": [{"id": 99, "title": "第 51 篇"}]}}
+        ),
+    )
+
+    assert "sectionType=0&offset=50&limit=10" in requested[0]
+    assert page.total == 62
+    assert page.offset == 50
+    assert page.entries[0]["id"] == 99
+
+
 def test_parse_website_announcement_maps_sections() -> None:
     result = website_crawler.parse_website_announcement(
         {"id": 17024, "title": "列表標題", "section": 1}, DETAIL_HTML

@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 
@@ -37,6 +39,7 @@ SECTION_NAMES = {
     21: "系統",
 }
 REQUEST_HEADERS = {"User-Agent": "MiracleNikkiDatabaseWebsiteSpike/1.0"}
+REQUEST_RETRIES = 2
 
 JsonFetcher = Callable[[str], object]
 TextFetcher = Callable[[str], str]
@@ -44,6 +47,20 @@ TextFetcher = Callable[[str], str]
 
 class WebsiteCrawlerError(RuntimeError):
     """Raised when an official website response cannot be parsed safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class WebsiteNewsPage:
+    """One page from the official JSON list endpoint.
+
+    The homepage itself is client rendered, but its data comes from this public
+    endpoint.  Keeping pagination here lets callers reuse the verified list
+    contract instead of scraping CSS-module classes from the homepage.
+    """
+
+    entries: list[Mapping[str, object]]
+    total: int
+    offset: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,28 +115,46 @@ def parse_numeric_news_id(value: str) -> str:
 
 def fetch_json(url: str) -> object:
     """Fetch JSON from the official website without requiring Playwright."""
-    try:
-        with urlopen(Request(url, headers=REQUEST_HEADERS), timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise WebsiteCrawlerError(f"Could not fetch JSON from {url}: {error}") from error
+    for attempt in range(REQUEST_RETRIES + 1):
+        try:
+            with urlopen(Request(url, headers=REQUEST_HEADERS), timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            if attempt == REQUEST_RETRIES:
+                raise WebsiteCrawlerError(f"Could not fetch JSON from {url}: {error}") from error
+            LOGGER.warning("Official list request failed; retrying url=%s attempt=%s", url, attempt + 1)
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def fetch_text(url: str) -> str:
     """Fetch one official news detail document."""
-    try:
-        with urlopen(Request(url, headers=REQUEST_HEADERS), timeout=30) as response:
-            return response.read().decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise WebsiteCrawlerError(f"Could not fetch detail page {url}: {error}") from error
+    for attempt in range(REQUEST_RETRIES + 1):
+        try:
+            with urlopen(Request(url, headers=REQUEST_HEADERS), timeout=30) as response:
+                return response.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            if attempt == REQUEST_RETRIES:
+                raise WebsiteCrawlerError(f"Could not fetch detail page {url}: {error}") from error
+            LOGGER.warning("Official detail request failed; retrying url=%s attempt=%s", url, attempt + 1)
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
-def fetch_news_list(limit: int, *, json_fetcher: JsonFetcher = fetch_json) -> list[Mapping[str, object]]:
-    """Read the current official list API, which is the homepage's data source."""
+def fetch_news_page(
+    *,
+    offset: int,
+    limit: int,
+    section_type: int = 0,
+    json_fetcher: JsonFetcher = fetch_json,
+) -> WebsiteNewsPage:
+    """Read one page of the official list API without a DOM selector dependency."""
     if limit < 1:
         raise ValueError("limit must be at least 1")
+    if offset < 0:
+        raise ValueError("offset must not be negative")
 
-    payload = json_fetcher(f"{NEWS_LIST_URL}?sectionType=0&offset=0&limit={limit}")
+    payload = json_fetcher(f"{NEWS_LIST_URL}?sectionType={section_type}&offset={offset}&limit={limit}")
     if not isinstance(payload, Mapping) or payload.get("ret") != 0:
         raise WebsiteCrawlerError("Official news list response has an unexpected result code")
 
@@ -129,6 +164,9 @@ def fetch_news_list(limit: int, *, json_fetcher: JsonFetcher = fetch_json) -> li
     entries = outer_data.get("data")
     if not isinstance(entries, list):
         raise WebsiteCrawlerError("Official news list response is missing data.data")
+    total = outer_data.get("total")
+    if not isinstance(total, int) or total < 0:
+        raise WebsiteCrawlerError("Official news list response is missing a valid data.total")
 
     rows: list[Mapping[str, object]] = []
     for entry in entries[:limit]:
@@ -139,7 +177,12 @@ def fetch_news_list(limit: int, *, json_fetcher: JsonFetcher = fetch_json) -> li
         if not str(entry.get("title", "")).strip():
             raise WebsiteCrawlerError("Official news list item is missing title")
         rows.append(entry)
-    return rows
+    return WebsiteNewsPage(entries=rows, total=total, offset=offset)
+
+
+def fetch_news_list(limit: int, *, json_fetcher: JsonFetcher = fetch_json) -> list[Mapping[str, object]]:
+    """Read the newest official items, preserving the original spike API."""
+    return fetch_news_page(limit=limit, offset=0, json_fetcher=json_fetcher).entries
 
 
 class _NextDataParser(HTMLParser):
@@ -172,18 +215,30 @@ class _ContentHTMLParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.text_parts: list[str] = []
         self.image_urls: list[str] = []
+        self._ignored_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
+        if tag in {"footer", "nav", "header", "script", "style"}:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth:
+            return
         if tag in self.BLOCK_TAGS:
             self.text_parts.append("\n")
         if tag == "img":
-            source = attributes.get("src")
-            if source and source.strip():
-                self.image_urls.append(source.strip())
+            source = _content_image_source(attributes)
+            class_name = str(attributes.get("class", "")).casefold()
+            if source and "logo" not in class_name and "icon" not in class_name:
+                self.image_urls.append(source)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"footer", "nav", "header", "script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        self.text_parts.append(data)
+        if not self._ignored_depth:
+            self.text_parts.append(data)
 
     def get_text(self) -> str:
         text = "".join(self.text_parts).replace("\r\n", "\n")
@@ -191,6 +246,20 @@ class _ContentHTMLParser(HTMLParser):
         text = re.sub(r" *\n *", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+
+def _content_image_source(attributes: Mapping[str, str | None]) -> str | None:
+    """Return the first usable body-image URL, including common lazy-load forms."""
+    for key in ("src", "data-src", "data-original"):
+        value = attributes.get(key)
+        if value and value.strip() and not value.strip().startswith("data:"):
+            return value.strip()
+    srcset = attributes.get("srcset")
+    if srcset:
+        first = srcset.split(",", 1)[0].strip().split(" ", 1)[0]
+        if first and not first.startswith("data:"):
+            return first
+    return None
 
 
 def parse_next_data(document: str, *, url: str) -> Mapping[str, object]:
@@ -251,7 +320,7 @@ def parse_website_announcement(list_item: Mapping[str, object], document: str) -
     content_html = detail.get("content_html")
     if not isinstance(title, str) or not title.strip():
         raise WebsiteCrawlerError(f"Detail page is missing title: {url}")
-    if not isinstance(content_html, str):
+    if not isinstance(content_html, str) or not content_html.strip():
         raise WebsiteCrawlerError(f"Detail page is missing content_html: {url}")
 
     try:
@@ -259,6 +328,7 @@ def parse_website_announcement(list_item: Mapping[str, object], document: str) -
     except (TypeError, ValueError) as error:
         raise WebsiteCrawlerError(f"List item has invalid section: {url}") from error
     content_text, image_urls = extract_content(content_html)
+    image_urls = list(dict.fromkeys(urljoin(url, image_url) for image_url in image_urls))
     return WebsiteAnnouncement(
         source_post_id=source_post_id,
         url=url,

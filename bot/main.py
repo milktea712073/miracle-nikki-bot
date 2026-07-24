@@ -24,9 +24,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from announcement.dispatcher import dispatch_delivery
+from announcement.history_search import AnnouncementHistorySearchService
 from announcement.models import Announcement, CN_OFFICIAL, TW_OFFICIAL
+from announcement.search import keyword_search_variants
 from announcement.state_store import AnnouncementStateStore
 from bot.admin.checks import is_administrator, is_administrator_channel
+from bot.announcement_search_view import (
+    AnnouncementSearchResultView,
+    build_announcement_message_payloads,
+    send_announcement_payloads,
+)
 from bot.admin.knowledge_event_views import EventAdminView
 from bot.admin.knowledge_suit_views import SuitAdminView
 from bot.knowledge_formatting import format_cost_line, format_suit_cost_value
@@ -152,6 +159,11 @@ OFFICIAL_POLL_LIMIT = 10
 DISCORD_EMBEDS_PER_MESSAGE = load_bounded_integer(
     "DISCORD_EMBEDS_PER_MESSAGE", default=10, minimum=1, maximum=10
 )
+ANNOUNCEMENT_SEARCH_SOURCES = {
+    "all": None,
+    "tw": TW_OFFICIAL,
+    "cn": CN_OFFICIAL,
+}
 facebook_initial_poll_complete = asyncio.Event()
 tw_initial_poll_complete = asyncio.Event()
 official_initial_poll_complete = asyncio.Event()
@@ -471,6 +483,111 @@ async def suit_name_autocomplete(
         LOGGER.exception("讀取套裝名稱提示失敗。")
         return []
     return [app_commands.Choice(name=name, value=name) for name in names]
+
+
+@bot.tree.command(name="公告搜尋", description="搜尋已保存的台服與陸服官方公告")
+@app_commands.rename(keyword="關鍵字", source="公告來源")
+@app_commands.describe(keyword="搜尋公告標題與正文", source="選擇全部、台服或陸服公告")
+@app_commands.choices(
+    source=[
+        app_commands.Choice(name="全部", value="all"),
+        app_commands.Choice(name="台服", value="tw"),
+        app_commands.Choice(name="陸服", value="cn"),
+    ]
+)
+async def announcement_search_command(
+    interaction: discord.Interaction,
+    keyword: str,
+    source: str = "all",
+) -> None:
+    """Search persisted official notices without invoking the announcement pipeline."""
+    try:
+        await interaction.response.defer(thinking=True)
+    except Exception:
+        LOGGER.exception("Unable to acknowledge announcement search interaction.")
+        return
+    if not is_query_channel(interaction.channel_id):
+        await interaction.followup.send("請到指定的查詢頻道使用此指令。", ephemeral=True)
+        return
+    normalized_keyword = keyword.strip()
+    if not normalized_keyword:
+        await interaction.followup.send("請輸入公告搜尋關鍵字。", ephemeral=True)
+        return
+    source_filter = ANNOUNCEMENT_SEARCH_SOURCES.get(source)
+    if source not in ANNOUNCEMENT_SEARCH_SOURCES:
+        await interaction.followup.send("請選擇有效的公告伺服器篩選條件。", ephemeral=True)
+        return
+
+    try:
+        search_page = await asyncio.to_thread(
+            AnnouncementHistorySearchService().search,
+            normalized_keyword,
+            source=source_filter,
+            limit=None,
+        )
+    except Exception:
+        LOGGER.exception("公告搜尋失敗 keyword=%r source=%r", normalized_keyword, source)
+        await interaction.followup.send("公告搜尋時發生錯誤，請稍後再試。", ephemeral=True)
+        return
+
+    if not search_page.results:
+        await interaction.followup.send(
+            f"找不到包含「{normalized_keyword}」的公告。",
+            ephemeral=True,
+        )
+        return
+    highlight_terms = keyword_search_variants(normalized_keyword)
+    if len(search_page.results) == 1:
+        result = search_page.results[0]
+        try:
+            payloads = build_announcement_message_payloads(
+                result,
+                owner_user_id=interaction.user.id,
+                highlight_terms=highlight_terms,
+            )
+            await send_announcement_payloads(interaction, payloads, ephemeral=False)
+        except Exception:
+            LOGGER.exception(
+                "Announcement-search single-result rendering failed keyword=%r source_filter=%r "
+                "source_kind=%s notice_source=%s external_id=%s record_id=%s",
+                normalized_keyword,
+                source,
+                result.source_kind,
+                result.source,
+                result.external_id,
+                result.source_record_id,
+            )
+            try:
+                await interaction.followup.send("公告搜尋結果呈現失敗，請稍後再試。", ephemeral=True)
+            except Exception:
+                LOGGER.exception("Unable to report announcement-search rendering failure.")
+        return
+
+    view = AnnouncementSearchResultView(
+        results=search_page.results,
+        owner_user_id=interaction.user.id,
+        keyword=normalized_keyword,
+        source_filter=source,
+        highlight_terms=highlight_terms,
+    )
+    try:
+        message = await interaction.followup.send(
+            embed=view.embed(),
+            view=view,
+            wait=True,
+        )
+        view.message = message
+    except Exception:
+        LOGGER.exception(
+            "Announcement-search result-list rendering failed keyword=%r source_filter=%r result_count=%d",
+            normalized_keyword,
+            source,
+            len(search_page.results),
+        )
+        try:
+            await interaction.followup.send("公告搜尋結果呈現失敗，請稍後再試。", ephemeral=True)
+        except Exception:
+            LOGGER.exception("Unable to report announcement-search result-list rendering failure.")
 
 
 @bot.tree.command(name="活動", description="查詢已確認匯入的活動資料")

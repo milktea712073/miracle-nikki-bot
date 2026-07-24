@@ -135,6 +135,8 @@ def test_bot_startup_initializes_only_v2_announcement_state(tmp_path, monkeypatc
     database_path = tmp_path / "announcement-state.db"
     from announcement.state_store import AnnouncementStateStore
 
+    monkeypatch.setattr(bot_main, "ENABLE_ANNOUNCEMENT_PIPELINE", True)
+    monkeypatch.setattr(bot_main, "GUILD_ID", None)
     monkeypatch.setattr(bot_main, "AnnouncementStateStore", lambda: AnnouncementStateStore(database_path))
 
     async def fake_sync() -> list[object]:
@@ -159,4 +161,5 @@ def test_bot_startup_initializes_only_v2_announcement_state(tmp_path, monkeypatc
         "announcement_deliveries",
         "reminders",
     }.issubset(table_names)
-    assert {"raw_posts", "announcement_jobs", "events", "suits"}.isdisjoint(table_names)
+    assert {"raw_posts", "raw_post_images"}.issubset(table_names)
+    assert {"announcement_jobs", "events", "suits"}.isdisjoint(table_names)
