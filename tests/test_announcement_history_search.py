@@ -178,6 +178,74 @@ def test_merged_results_sort_by_date_and_apply_one_global_limit(tmp_path: Path) 
     assert page.has_more is True
 
 
+def test_unbounded_search_returns_all_matching_results_for_discord_pagination(tmp_path: Path) -> None:
+    history, store, _raw_path = service(tmp_path)
+    for index in range(11):
+        store.register(
+            make_announcement(
+                f"state-{index}",
+                title="願之庭",
+                published_at=datetime(2026, 1, index + 1, tzinfo=timezone.utc),
+            ),
+            [],
+        )
+
+    page = history.search("願之庭", limit=None)
+
+    assert len(page.results) == 11
+    assert page.has_more is False
+
+
+def test_all_source_search_orders_tw_before_cn_and_sorts_each_region_by_date(tmp_path: Path) -> None:
+    history, store, _raw_path = service(tmp_path)
+    store.register(
+        make_announcement(
+            "tw-old",
+            title="共同關鍵字",
+            published_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        [],
+    )
+    store.register(
+        make_announcement(
+            "tw-new",
+            title="共同關鍵字",
+            published_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        ),
+        [],
+    )
+    store.register(make_announcement("tw-undated", title="共同關鍵字"), [])
+    store.register(
+        make_announcement(
+            "cn-old",
+            source=CN_OFFICIAL,
+            title="共同關鍵字",
+            published_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        ),
+        [],
+    )
+    store.register(
+        make_announcement(
+            "cn-new",
+            source=CN_OFFICIAL,
+            title="共同關鍵字",
+            published_at=datetime(2026, 4, 1, tzinfo=timezone.utc),
+        ),
+        [],
+    )
+    store.register(make_announcement("cn-undated", source=CN_OFFICIAL, title="共同關鍵字"), [])
+
+    all_results = history.search("共同關鍵字", limit=None).results
+    tw_results = history.search("共同關鍵字", source=TW_OFFICIAL, limit=None).results
+    cn_results = history.search("共同關鍵字", source=CN_OFFICIAL, limit=None).results
+
+    assert [result.external_id for result in all_results] == [
+        "tw-new", "tw-old", "tw-undated", "cn-new", "cn-old", "cn-undated",
+    ]
+    assert [result.external_id for result in tw_results] == ["tw-new", "tw-old", "tw-undated"]
+    assert [result.external_id for result in cn_results] == ["cn-new", "cn-old", "cn-undated"]
+
+
 def test_region_filters_include_recognized_tw_and_cn_raw_posts(tmp_path: Path) -> None:
     history, _store, raw_path = service(tmp_path)
     insert_raw_post(raw_path, 1, source="facebook", content="鑽石活動")

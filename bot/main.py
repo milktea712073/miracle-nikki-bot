@@ -32,7 +32,6 @@ from bot.admin.checks import is_administrator, is_administrator_channel
 from bot.announcement_search_view import (
     AnnouncementSearchResultView,
     build_announcement_message_payloads,
-    build_search_results_embed,
     send_announcement_payloads,
 )
 from bot.admin.knowledge_event_views import EventAdminView
@@ -160,7 +159,6 @@ OFFICIAL_POLL_LIMIT = 10
 DISCORD_EMBEDS_PER_MESSAGE = load_bounded_integer(
     "DISCORD_EMBEDS_PER_MESSAGE", default=10, minimum=1, maximum=10
 )
-ANNOUNCEMENT_SEARCH_LIMIT = 10
 ANNOUNCEMENT_SEARCH_SOURCES = {
     "all": None,
     "tw": TW_OFFICIAL,
@@ -525,7 +523,7 @@ async def announcement_search_command(
             AnnouncementHistorySearchService().search,
             normalized_keyword,
             source=source_filter,
-            limit=ANNOUNCEMENT_SEARCH_LIMIT,
+            limit=None,
         )
     except Exception:
         LOGGER.exception("公告搜尋失敗 keyword=%r source=%r", normalized_keyword, source)
@@ -574,7 +572,7 @@ async def announcement_search_command(
     )
     try:
         message = await interaction.followup.send(
-            embed=build_search_results_embed(search_page.results, keyword=normalized_keyword),
+            embed=view.embed(),
             view=view,
             wait=True,
         )

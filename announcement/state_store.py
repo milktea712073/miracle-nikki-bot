@@ -178,13 +178,13 @@ class AnnouncementStateStore:
         keyword: str,
         *,
         source: str | None = None,
-        limit: int = 10,
+        limit: int | None = 10,
     ) -> AnnouncementSearchPage:
         """Search title and body with literal Traditional/Simplified keyword variants."""
         normalized_keyword = keyword.strip()
         if not normalized_keyword:
             raise ValueError("keyword must not be blank")
-        if limit < 1:
+        if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
 
         match_clauses: list[str] = []
@@ -203,7 +203,10 @@ class AnnouncementStateStore:
         else:
             where_clauses.append("source IN (?, ?, ?)")
             parameters.extend((TW_OFFICIAL, CN_OFFICIAL, TW_FACEBOOK_SOURCE))
-        parameters.append(limit + 1)
+        limit_clause = ""
+        if limit is not None:
+            parameters.append(limit + 1)
+            limit_clause = "LIMIT ?"
 
         connection = self._connect()
         try:
@@ -213,14 +216,15 @@ class AnnouncementStateStore:
                 FROM announcements
                 WHERE {' AND '.join(where_clauses)}
                 ORDER BY published_at IS NULL ASC, published_at DESC, id DESC
-                LIMIT ?
+                {limit_clause}
                 """,
                 parameters,
             ).fetchall()
         finally:
             connection.close()
 
-        has_more = len(rows) > limit
+        has_more = limit is not None and len(rows) > limit
+        result_rows = rows if limit is None else rows[:limit]
         return AnnouncementSearchPage(
             results=tuple(
                 AnnouncementSearchResult(
@@ -235,7 +239,7 @@ class AnnouncementStateStore:
                     content_text=str(row[6]),
                     image_urls=_load_image_urls(row[7]),
                 )
-                for row in rows[:limit]
+                for row in result_rows
             ),
             has_more=has_more,
         )

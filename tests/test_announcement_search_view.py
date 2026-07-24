@@ -28,6 +28,7 @@ def make_result(
     region: str | None = "tw",
     content: str = "First paragraph.\n\nSecond paragraph.",
     images: tuple[str, ...] = (),
+    published_at: str | None = "2026-07-23T08:00:00+00:00",
 ) -> AnnouncementSearchResult:
     return AnnouncementSearchResult(
         source_kind=source_kind,
@@ -37,7 +38,7 @@ def make_result(
         external_id=str(record_id),
         title=f"Notice {record_id}",
         canonical_url=f"https://official.example/{record_id}",
-        published_at="2026-07-23T08:00:00+00:00",
+        published_at=published_at,
         content_text=content,
         image_urls=images,
     )
@@ -305,11 +306,179 @@ def test_result_list_uses_safe_select_options_and_compact_public_embed() -> None
     assert "找到 2 筆公告" in embed.title
     assert "願之庭" in embed.description
     assert "First paragraph" not in embed.description
+    assert "🇹🇼 台服（1）" in embed.description
+    assert "🇨🇳 陸服（1）" in embed.description
+    assert embed.footer.text == "依發布時間由新到舊・台服優先顯示"
     assert select.placeholder == "選擇公告"
     assert len(select.options) == 2
     assert [option.value for option in select.options] == ["0", "1"]
     assert all(len(option.label) <= 100 for option in select.options)
     assert all(len(option.description or "") <= 100 for option in select.options)
+
+
+def test_result_list_with_ten_results_has_one_page_and_disabled_navigation() -> None:
+    results = tuple(make_result(index) for index in range(1, 11))
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="願之庭",
+        source_filter="all",
+    )
+
+    assert view.total_pages == 1
+    assert view.previous_page_button.disabled is True
+    assert view.next_page_button.disabled is True
+    assert [option.value for option in view.result_select.options] == [str(index) for index in range(10)]
+    assert "第 1 / 1 頁" in view.embed().description
+
+
+def test_result_list_with_eleven_results_updates_select_for_second_page() -> None:
+    results = tuple(make_result(index) for index in range(1, 12))
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="願之庭",
+        source_filter="all",
+    )
+    interaction = FakeInteraction()
+
+    assert view.total_pages == 2
+    assert view.previous_page_button.disabled is True
+    assert view.next_page_button.disabled is False
+    asyncio.run(view.next_page_button.callback(interaction))
+
+    assert view.page_index == 1
+    assert "第 2 / 2 頁" in interaction.response.edits[-1]["embed"].description
+    assert [option.value for option in view.result_select.options] == ["10"]
+    assert view.previous_page_button.disabled is False
+    assert view.next_page_button.disabled is True
+
+
+def test_result_list_with_twenty_one_results_uses_global_numbers_and_page_boundaries() -> None:
+    results = tuple(make_result(index) for index in range(1, 22))
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="願之庭",
+        source_filter="all",
+    )
+    interaction = FakeInteraction()
+
+    assert view.total_pages == 3
+    asyncio.run(view.next_page_button.callback(interaction))
+    assert "11. **Notice 11**" in interaction.response.edits[-1]["embed"].description
+    assert [option.value for option in view.result_select.options] == [str(index) for index in range(10, 20)]
+    asyncio.run(view.next_page_button.callback(interaction))
+    assert "21. **Notice 21**" in interaction.response.edits[-1]["embed"].description
+    assert [option.value for option in view.result_select.options] == ["20"]
+    assert view.next_page_button.disabled is True
+    asyncio.run(view.previous_page_button.callback(interaction))
+    assert view.page_index == 1
+    assert view.previous_page_button.disabled is False
+
+
+def test_result_select_uses_global_index_after_changing_page() -> None:
+    results = tuple(make_result(index, content=f"第 {index} 篇完整公告。") for index in range(1, 12))
+    view = AnnouncementSearchResultView(
+        results=results,
+        owner_user_id=1,
+        keyword="海歌",
+        source_filter="all",
+    )
+    asyncio.run(view.next_page_button.callback(FakeInteraction()))
+    view.result_select._values = ["10"]
+    interaction = FakeSelectionInteraction()
+
+    asyncio.run(view.result_select.callback(interaction))
+
+    assert "第 11 篇完整公告。" in interaction.followup.messages[0][1]["embeds"][0].description
+
+
+def test_grouped_pages_show_full_region_totals_and_keep_select_order_in_sync() -> None:
+    tw_results = tuple(
+        make_result(
+            index,
+            source="tw_official",
+            region="tw",
+            content=f"台服第 {index} 篇。",
+        )
+        for index in range(1, 14)
+    )
+    cn_results = tuple(
+        make_result(
+            100 + index,
+            source="cn_official",
+            region="cn",
+            content=f"陸服第 {index} 篇。",
+        )
+        for index in range(1, 10)
+    )
+    view = AnnouncementSearchResultView(
+        results=(*tw_results, *cn_results),
+        owner_user_id=1,
+        keyword="活動",
+        source_filter="all",
+    )
+    interaction = FakeInteraction()
+
+    first_page = view.embed().description
+    assert "🇹🇼 台服（13）" in first_page
+    assert "🇨🇳 陸服" not in first_page
+    assert "1. **Notice 1**" in first_page
+    assert "10. **Notice 10**" in first_page
+    assert [option.value for option in view.result_select.options] == [str(index) for index in range(10)]
+
+    asyncio.run(view.next_page_button.callback(interaction))
+    second_page = interaction.response.edits[-1]["embed"].description
+    assert "🇹🇼 台服（13）" in second_page
+    assert "🇨🇳 陸服（9）" in second_page
+    assert "11. **Notice 11**" in second_page
+    assert "14. **Notice 101**" in second_page
+    assert [option.value for option in view.result_select.options] == [str(index) for index in range(10, 20)]
+    assert view.result_select.options[0].label.startswith("11. Notice 11")
+    assert view.result_select.options[3].label.startswith("14. Notice 101")
+    assert view.result_select.options[3].description == "2026/07/23・陸服"
+
+    asyncio.run(view.next_page_button.callback(interaction))
+    third_page = interaction.response.edits[-1]["embed"].description
+    assert "🇹🇼 台服" not in third_page
+    assert "🇨🇳 陸服（9）" in third_page
+    assert "21. **Notice 108**" in third_page
+    assert "22. **Notice 109**" in third_page
+
+
+def test_second_page_cross_region_selection_opens_its_matching_notice() -> None:
+    tw_results = tuple(make_result(index, content=f"台服第 {index} 篇。") for index in range(1, 14))
+    cn_results = tuple(
+        make_result(100 + index, source="cn_official", region="cn", content=f"陸服第 {index} 篇。")
+        for index in range(1, 10)
+    )
+    view = AnnouncementSearchResultView(
+        results=(*tw_results, *cn_results),
+        owner_user_id=1,
+        keyword="活動",
+        source_filter="all",
+    )
+    asyncio.run(view.next_page_button.callback(FakeInteraction()))
+    view.result_select._values = ["13"]
+    interaction = FakeSelectionInteraction()
+
+    asyncio.run(view.result_select.callback(interaction))
+
+    assert "陸服第 1 篇。" in interaction.followup.messages[0][1]["embeds"][0].description
+
+
+def test_single_region_page_does_not_render_an_empty_other_region_section() -> None:
+    tw_results = (make_result(1, source="tw_official", region="tw"), make_result(2, source="facebook", region="tw"))
+    cn_results = (make_result(3, source="cn_official", region="cn"),)
+
+    tw_embed = build_search_results_embed(tw_results, keyword="活動")
+    cn_embed = build_search_results_embed(cn_results, keyword="活動")
+
+    assert "🇹🇼 台服（2）" in tw_embed.description
+    assert "🇨🇳 陸服" not in tw_embed.description
+    assert "🇨🇳 陸服（1）" in cn_embed.description
+    assert "🇹🇼 台服" not in cn_embed.description
 
 
 def test_result_select_sends_selected_complete_notice_ephemerally() -> None:

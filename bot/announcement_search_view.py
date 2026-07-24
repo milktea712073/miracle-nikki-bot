@@ -14,6 +14,7 @@ from announcement.search_models import AnnouncementSearchResult
 
 LOGGER = logging.getLogger(__name__)
 SEARCH_VIEW_TIMEOUT_SECONDS = 300
+SEARCH_RESULTS_PER_PAGE = 10
 MAX_EMBED_DESCRIPTION_LENGTH = 4096
 MAX_EMBED_TITLE_LENGTH = 256
 MAX_EMBEDS_PER_MESSAGE = 10
@@ -76,20 +77,46 @@ def highlight_search_terms(
 
 
 def build_search_results_embed(
-    results: tuple[AnnouncementSearchResult, ...], *, keyword: str
+    results: tuple[AnnouncementSearchResult, ...],
+    *,
+    keyword: str,
+    page_index: int = 0,
+    page_size: int = SEARCH_RESULTS_PER_PAGE,
 ) -> discord.Embed:
     """Build the compact public result list for a multi-result search."""
-    lines = [f"關鍵字：{keyword}", ""]
-    for index, result in enumerate(results, start=1):
-        lines.append(f"{index}. {_result_title(result, 180)}")
-        lines.append(f"   {_result_date_label(result)}｜{_result_source_label(result)}")
-        lines.append("")
+    total_results = len(results)
+    total_pages = max(1, (total_results + page_size - 1) // page_size)
+    current_page = min(max(page_index, 0), total_pages - 1)
+    start_index = current_page * page_size
+    page_results = results[start_index : start_index + page_size]
+    lines = [f"關鍵字：{keyword}", f"第 {current_page + 1} / {total_pages} 頁", ""]
+    region_totals = {
+        region: sum(1 for result in results if result.region == region)
+        for region in REGION_LABELS
+    }
+    displayed_regions: set[str | None] = set()
+    for index, result in enumerate(page_results, start=start_index + 1):
+        if result.region not in displayed_regions:
+            if displayed_regions:
+                lines.append("")
+            displayed_regions.add(result.region)
+            if result.region in REGION_LABELS:
+                flag = "🇹🇼" if result.region == "tw" else "🇨🇳"
+                lines.append(f"{flag} {REGION_LABELS[result.region]}（{region_totals[result.region]}）")
+                lines.append("────────────")
+            else:
+                lines.append(_result_source_label(result))
+                lines.append("────────────")
+        lines.append(f"{index}. **{_result_title(result, 180)}**")
+        lines.append(f"   {_result_date_label(result)}")
     lines.append("請從下方選擇要查看的公告。")
-    return discord.Embed(
-        title=f"🔎 找到 {len(results)} 筆公告",
+    embed = discord.Embed(
+        title=f"🔎 找到 {total_results} 筆公告",
         description="\n".join(lines)[:MAX_EMBED_DESCRIPTION_LENGTH],
         color=discord.Color.from_rgb(255, 183, 197),
     )
+    embed.set_footer(text="依發布時間由新到舊・台服優先顯示")
+    return embed
 
 
 async def send_announcement_payloads(
@@ -268,17 +295,15 @@ class AnnouncementSearchResultSelect(discord.ui.Select):
 
     def __init__(self, parent: AnnouncementSearchResultView) -> None:
         self.parent_view = parent
-        options = [
-            discord.SelectOption(
-                label=_result_title(result),
-                description=_truncate(
-                    f"{_result_date_label(result)}｜{_result_source_label(result)}", 100
-                ),
-                value=str(index),
-            )
-            for index, result in enumerate(parent.results)
-        ]
-        super().__init__(placeholder="選擇公告", min_values=1, max_values=1, options=options)
+        super().__init__(
+            placeholder="選擇公告",
+            min_values=1,
+            max_values=1,
+            options=parent.select_options(),
+        )
+
+    def refresh_options(self) -> None:
+        self.options = self.parent_view.select_options()
 
     async def callback(self, interaction: discord.Interaction) -> None:
         selected_index = int(self.values[0])
@@ -315,7 +340,7 @@ class AnnouncementSearchResultSelect(discord.ui.Select):
 
 
 class AnnouncementSearchResultView(discord.ui.View):
-    """Public compact search list with an owner-bound result selector."""
+    """Public, owner-bound search result list with ten-result pages."""
 
     def __init__(
         self,
@@ -332,8 +357,65 @@ class AnnouncementSearchResultView(discord.ui.View):
         self.keyword = keyword
         self.source_filter = source_filter
         self.highlight_terms = highlight_terms
+        self.page_index = 0
         self.message: discord.Message | discord.WebhookMessage | None = None
-        self.add_item(AnnouncementSearchResultSelect(self))
+        self.result_select = AnnouncementSearchResultSelect(self)
+        self.previous_page_button = discord.ui.Button(
+            label="◀ 上一頁", style=discord.ButtonStyle.secondary, row=1
+        )
+        self.next_page_button = discord.ui.Button(
+            label="下一頁 ▶", style=discord.ButtonStyle.secondary, row=1
+        )
+        self.previous_page_button.callback = self._previous_page
+        self.next_page_button.callback = self._next_page
+        self.add_item(self.result_select)
+        self.add_item(self.previous_page_button)
+        self.add_item(self.next_page_button)
+        self._update_navigation()
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.results) + SEARCH_RESULTS_PER_PAGE - 1) // SEARCH_RESULTS_PER_PAGE)
+
+    def select_options(self) -> list[discord.SelectOption]:
+        start_index = self.page_index * SEARCH_RESULTS_PER_PAGE
+        return [
+            discord.SelectOption(
+                label=_truncate(f"{index + 1}. {_result_title(result, 95)}", 100),
+                description=_truncate(
+                    f"{_result_date_label(result)}・{_result_source_label(result)}", 100
+                ),
+                value=str(index),
+            )
+            for index, result in enumerate(
+                self.results[start_index : start_index + SEARCH_RESULTS_PER_PAGE],
+                start=start_index,
+            )
+        ]
+
+    def embed(self) -> discord.Embed:
+        return build_search_results_embed(
+            self.results,
+            keyword=self.keyword,
+            page_index=self.page_index,
+        )
+
+    def _update_navigation(self) -> None:
+        self.previous_page_button.disabled = self.page_index <= 0
+        self.next_page_button.disabled = self.page_index >= self.total_pages - 1
+        self.result_select.disabled = not self.results
+        self.result_select.refresh_options()
+
+    async def _change_page(self, interaction: discord.Interaction, delta: int) -> None:
+        self.page_index = min(max(self.page_index + delta, 0), self.total_pages - 1)
+        self._update_navigation()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _previous_page(self, interaction: discord.Interaction) -> None:
+        await self._change_page(interaction, -1)
+
+    async def _next_page(self, interaction: discord.Interaction) -> None:
+        await self._change_page(interaction, 1)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_user_id:

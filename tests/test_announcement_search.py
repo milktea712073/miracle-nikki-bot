@@ -417,6 +417,43 @@ def test_search_command_exposes_fixed_announcement_source_choices() -> None:
     ]
 
 
+def test_search_command_requests_unbounded_results_for_result_list_pagination(monkeypatch) -> None:
+    interaction = FakeInteraction()
+    observed_limits: list[int | None] = []
+    results = tuple(
+        AnnouncementSearchResult(
+            source_kind="announcement",
+            source_record_id=index,
+            source="tw_official",
+            region="tw",
+            external_id=str(index),
+            title=f"願之庭 {index}",
+            canonical_url=f"https://official.example/{index}",
+            published_at="2026-07-23T00:00:00+00:00",
+            content_text="願之庭公告",
+            image_urls=(),
+        )
+        for index in range(11)
+    )
+
+    def search(*_args: object, **kwargs: object) -> AnnouncementSearchPage:
+        observed_limits.append(kwargs["limit"])
+        return AnnouncementSearchPage(results=results, has_more=False)
+
+    monkeypatch.setattr(bot_main, "is_query_channel", lambda _channel_id: True)
+    monkeypatch.setattr(
+        bot_main,
+        "AnnouncementHistorySearchService",
+        lambda: SimpleNamespace(search=search),
+    )
+
+    asyncio.run(bot_main.announcement_search_command.callback(interaction, "願之庭", "all"))
+
+    assert observed_limits == [None]
+    view = interaction.followup.messages[0][1]["view"]
+    assert view.total_pages == 2
+
+
 def test_search_command_rejects_unknown_source_value(monkeypatch) -> None:
     interaction = FakeInteraction()
     monkeypatch.setattr(bot_main, "is_query_channel", lambda _channel_id: True)

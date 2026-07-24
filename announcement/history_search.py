@@ -128,12 +128,35 @@ def _priority(result: AnnouncementSearchResult) -> tuple[int, int]:
     return (0 if result.source_kind == "announcement" else 1, result.source_record_id)
 
 
+def _search_result_sort_key(
+    result: AnnouncementSearchResult,
+    *,
+    prefer_tw_region: bool,
+) -> tuple[object, ...]:
+    """Keep the merged result order deterministic, with optional TW-first grouping."""
+    published_sort_value = _published_sort_value(result.published_at)
+    region_group = 0
+    if prefer_tw_region:
+        region_group = 0 if result.region == TW_REGION else 1 if result.region == CN_REGION else 2
+    return (
+        region_group,
+        published_sort_value is None,
+        -(published_sort_value or 0.0),
+        result.source,
+        result.external_id,
+        result.source_kind,
+        result.source_record_id,
+    )
+
+
 def _ordered_unique(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))
 
 
 def merge_search_results(
     candidates: tuple[AnnouncementSearchResult, ...],
+    *,
+    prefer_tw_region: bool = False,
 ) -> tuple[tuple[AnnouncementSearchResult, ...], frozenset[tuple[str, int]]]:
     """Deduplicate two stores while giving active announcement rows canonical priority."""
     groups: list[list[AnnouncementSearchResult]] = []
@@ -184,14 +207,7 @@ def merge_search_results(
             )
         )
 
-    merged.sort(
-        key=lambda result: (
-            _published_sort_value(result.published_at) is not None,
-            _published_sort_value(result.published_at) or 0.0,
-            result.source_record_id,
-        ),
-        reverse=True,
-    )
+    merged.sort(key=lambda result: _search_result_sort_key(result, prefer_tw_region=prefer_tw_region))
     return tuple(merged), frozenset(retained_keys)
 
 
@@ -218,7 +234,7 @@ class AnnouncementHistorySearchService:
         keyword: str,
         *,
         source: str | None,
-        candidate_limit: int,
+        candidate_limit: int | None,
     ) -> tuple[tuple[AnnouncementSearchResult, ...], bool]:
         if not self.state_database_path.exists():
             return (), False
@@ -234,7 +250,7 @@ class AnnouncementHistorySearchService:
         keyword: str,
         *,
         desired_region: str | None,
-        candidate_limit: int,
+        candidate_limit: int | None,
     ) -> tuple[tuple[AnnouncementSearchResult, ...], bool]:
         if not self.state_database_path.exists():
             return (), False
@@ -262,6 +278,11 @@ class AnnouncementHistorySearchService:
             ).fetchone()
             if raw_posts_exists is None:
                 return (), False
+            limit_clause = ""
+            parameters: list[object] = [*source_regions, *match_parameters]
+            if candidate_limit is not None:
+                limit_clause = "LIMIT ?"
+                parameters.append(candidate_limit + 1)
             rows = connection.execute(
                 f"""
                 SELECT id, source, source_post_id, url, content, published_at, metadata_json
@@ -269,11 +290,11 @@ class AnnouncementHistorySearchService:
                 WHERE source IN ({source_placeholders})
                   AND ({' OR '.join(match_clauses)})
                 ORDER BY published_at IS NULL ASC, published_at DESC, id DESC
-                LIMIT ?
+                {limit_clause}
                 """,
-                [*source_regions, *match_parameters, candidate_limit + 1],
+                parameters,
             ).fetchall()
-            candidate_rows = rows[:candidate_limit]
+            candidate_rows = rows if candidate_limit is None else rows[:candidate_limit]
             images_by_raw_post_id: dict[int, list[str]] = {}
             if candidate_rows:
                 raw_ids = [int(row[0]) for row in candidate_rows]
@@ -312,37 +333,40 @@ class AnnouncementHistorySearchService:
                     image_urls=tuple(images_by_raw_post_id.get(int(raw_post_id), [])),
                 )
             )
-        return tuple(results), len(rows) > candidate_limit
+        return tuple(results), candidate_limit is not None and len(rows) > candidate_limit
 
     def diagnose(
         self,
         keyword: str,
         *,
         source: str | None = None,
-        limit: int = 10,
+        limit: int | None = 10,
     ) -> AnnouncementSearchDiagnostics:
         normalized_keyword = keyword.strip()
         if not normalized_keyword:
             raise ValueError("keyword must not be blank")
-        if limit < 1:
+        if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
         desired_region = self._desired_region(source)
         state_source = TW_OFFICIAL if desired_region == TW_REGION else CN_OFFICIAL if desired_region == CN_REGION else None
         state_candidates, state_has_more = self._search_state_candidates(
             normalized_keyword,
             source=state_source,
-            candidate_limit=DEFAULT_CANDIDATE_LIMIT,
+            candidate_limit=None if limit is None else max(DEFAULT_CANDIDATE_LIMIT, limit),
         )
         raw_candidates, raw_has_more = self._search_raw_candidates(
             normalized_keyword,
             desired_region=desired_region,
-            candidate_limit=DEFAULT_CANDIDATE_LIMIT,
+            candidate_limit=None if limit is None else max(DEFAULT_CANDIDATE_LIMIT, limit),
         )
-        merged, retained_keys = merge_search_results((*state_candidates, *raw_candidates))
+        merged, retained_keys = merge_search_results(
+            (*state_candidates, *raw_candidates),
+            prefer_tw_region=desired_region is None,
+        )
         return AnnouncementSearchDiagnostics(
             page=AnnouncementSearchPage(
-                results=merged[:limit],
-                has_more=len(merged) > limit or raw_has_more or state_has_more,
+                results=merged if limit is None else merged[:limit],
+                has_more=(limit is not None and len(merged) > limit) or raw_has_more or state_has_more,
             ),
             candidates=(*state_candidates, *raw_candidates),
             retained_keys=retained_keys,
@@ -353,6 +377,6 @@ class AnnouncementHistorySearchService:
         keyword: str,
         *,
         source: str | None = None,
-        limit: int = 10,
+        limit: int | None = 10,
     ) -> AnnouncementSearchPage:
         return self.diagnose(keyword, source=source, limit=limit).page
