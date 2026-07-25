@@ -49,6 +49,20 @@ ENABLE_ANNOUNCEMENT_PIPELINE=false
 
 本機只測試 Discord UI、Slash Commands、查詢或管理功能時，設定 `ENABLE_ANNOUNCEMENT_PIPELINE=false`。Bot 仍會登入 Discord 並同步指令，但不會初始化公告 state、輪詢官網、建立 delivery 或發送公告。需要驗證公告同步時才改為 `true`。
 
+### 小暖聊天亂入（選用）
+
+預設為關閉。只在測試頻道驗證時才設定下列變數；頻道白名單留空時，即使開關為 `true` 也不會回覆。
+
+```dotenv
+ENABLE_AMBIENT_NIKKI=true
+AMBIENT_NIKKI_RESPONSE_CHANCE=1.0
+AMBIENT_NIKKI_COOLDOWN_SECONDS=0
+AMBIENT_NIKKI_DAILY_LIMIT=100
+AMBIENT_NIKKI_CHANNEL_IDS=123456789012345678
+```
+
+正式環境建議維持 `ENABLE_AMBIENT_NIKKI=false`，直到已確認語料、頻道與回覆頻率。此功能需要在 Discord Developer Portal 為 Bot 開啟 Message Content Intent；它只處理伺服器中的一般文字訊息，不會處理私訊、Bot、Webhook 或系統訊息。
+
 只填入測試 token、Guild 與測試頻道。不得提交 `.env`、token、Guild／channel ID、外部 IP、deploy key、SQLite database 或 backup。
 
 ## 測試
