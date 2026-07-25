@@ -71,7 +71,7 @@ database/announcement_state.db
 python scripts/announcement/initialize_official_baseline.py
 ```
 
-Baseline 只記錄當下兩來源最新 external ID，避免第一次部署補送歷史公告。之後 poller 只處理比 baseline 新的公告。日常 restart 或更新不可重新初始化 baseline。
+Baseline 記錄當下兩來源官方列表第一篇的 external ID，避免第一次部署補送歷史公告。之後 poller 只處理本輪列表中位於 baseline 前方的公告；external ID 僅是身分，不以數字大小判斷新舊。baseline 不在抓取窗口時會安全略過該來源並保留 baseline。日常 restart 或更新不可重新初始化 baseline。
 
 Dispatcher（`announcement/dispatcher.py`）是唯一 Discord 送達路徑。只有成功送達後才標記該 channel delivery 為 sent；失敗會保留為可重試狀態。
 

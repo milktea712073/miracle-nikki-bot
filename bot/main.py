@@ -155,7 +155,7 @@ MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE = 3
 FACEBOOK_POLL_INTERVAL_MINUTES = 5
 FACEBOOK_POLL_LIMIT = 10
 OFFICIAL_POLL_INTERVAL_MINUTES = 5
-OFFICIAL_POLL_LIMIT = 10
+OFFICIAL_POLL_LIMIT = 20
 DISCORD_EMBEDS_PER_MESSAGE = load_bounded_integer(
     "DISCORD_EMBEDS_PER_MESSAGE", default=10, minimum=1, maximum=10
 )
@@ -706,20 +706,26 @@ async def poll_official_announcements() -> None:
                         label,
                     )
                     continue
-                new_announcements = [
-                    announcement
-                    for announcement in announcements
-                    if _is_newer_official_external_id(announcement.external_id, baseline)
-                ]
-                for announcement in sorted(
-                    new_announcements, key=lambda item: int(item.external_id)
-                ):
+                new_announcements = _announcements_before_official_baseline(announcements, baseline)
+                if new_announcements is None:
+                    LOGGER.warning(
+                        "%s baseline was not found in the fetched official list; "
+                        "no announcements were queued and the baseline was left unchanged "
+                        "source=%s baseline=%s fetched=%s",
+                        label,
+                        source,
+                        baseline,
+                        len(announcements),
+                    )
+                    continue
+                for announcement in reversed(new_announcements):
                     await asyncio.to_thread(state.register, announcement, channel_ids)
                 if new_announcements:
-                    latest_external_id = max(
-                        new_announcements, key=lambda item: int(item.external_id)
-                    ).external_id
-                    await asyncio.to_thread(state.set_official_baseline, source, latest_external_id)
+                    await asyncio.to_thread(
+                        state.set_official_baseline,
+                        source,
+                        announcements[0].external_id,
+                    )
                 LOGGER.info(
                     "%s poll completed fetched=%s queued=%s baseline=%s",
                     label, len(announcements), len(new_announcements), baseline,
@@ -730,13 +736,20 @@ async def poll_official_announcements() -> None:
         official_initial_poll_complete.set()
 
 
-def _is_newer_official_external_id(candidate: str, baseline: str) -> bool:
-    """Official website IDs are numeric and monotonically increase per source."""
-    try:
-        return int(candidate) > int(baseline)
-    except ValueError:
-        LOGGER.warning("Official external ID is not numeric candidate=%r baseline=%r", candidate, baseline)
-        return False
+def _announcements_before_official_baseline(
+    announcements: list[Announcement],
+    baseline_external_id: str,
+) -> list[Announcement] | None:
+    """Return latest-first notices before a source-list baseline anchor.
+
+    Official article IDs are identifiers, not a reliable chronological sequence.
+    Returning ``None`` distinguishes a missing anchor from a valid empty update
+    and lets the caller fail closed without advancing the baseline.
+    """
+    for index, announcement in enumerate(announcements):
+        if announcement.external_id == baseline_external_id:
+            return announcements[:index]
+    return None
 
 
 @tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)

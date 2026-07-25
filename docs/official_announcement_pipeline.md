@@ -51,8 +51,10 @@ python scripts/announcement/initialize_official_baseline.py
 正常 poller 的規則：
 
 1. 沒有 baseline 時，安全略過該來源並要求先初始化。
-2. 最新公告等於 baseline 時，不建立 delivery。
-3. external ID 比 baseline 新時，依序 register 公告、建立目標頻道的 pending delivery，並推進 baseline。
+2. crawler 回傳順序代表官方列表順序；第一篇為目前最新公告。
+3. poller 在本輪列表中尋找 baseline external ID。baseline 前方的公告才是新公告；external ID 僅作同篇公告身分，不比較數字大小。
+4. 新公告會由最舊到最新依序 register，建立目標頻道的 pending delivery，然後將 baseline 推進為本輪列表第一篇的 external ID。
+5. baseline 不在抓取窗口時，poller 會 fail-closed：不建立 delivery、不更新 baseline，並記錄 warning，避免網站重排或停機過久時誤補送舊公告。
 
 因此 poller 不會在第一次部署時補送官網現有歷史公告。
 
@@ -119,5 +121,5 @@ CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS=333333333333333333
 - Crawler 只取資料，不直接操作 SQLite 或 Discord。
 - `AnnouncementStateStore` 是去重、baseline 與 delivery 狀態的唯一權威來源。
 - Dispatcher 是唯一 Discord 送達路徑；不要在 crawler、replay 或 scheduler 內重新實作 Embed 或直接發送。
-- Poller 只處理 baseline 之後的新官方公告，不補送歷史公告。
+- Poller 以官方列表中的 baseline 位置辨識新公告，不以 external ID 數字大小判斷時序，也不補送歷史公告。
 - Facebook 仍保留為 legacy archive source，絕不屬於 live pipeline。
