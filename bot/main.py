@@ -721,15 +721,11 @@ async def handle_ambient_nikki_message(message: discord.Message) -> None:
             LOGGER.debug("Ambient Nikki skipped: %s", skip_reason)
             return
         try:
-<<<<<<< Updated upstream
-            await message.reply(f"🌸 小暖：{response.line}", mention_author=False)
-=======
             await message.reply(
                 response.text,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
->>>>>>> Stashed changes
         except discord.DiscordException:
             LOGGER.exception("Ambient Nikki reply failed; cooldown and daily count were not recorded.")
             return

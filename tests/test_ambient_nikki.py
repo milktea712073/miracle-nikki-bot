@@ -20,15 +20,6 @@ from bot.ambient_nikki.skills import (
     render_sleep_event,
 )
 
-
-<<<<<<< Updated upstream
-LINES_PATH = Path(__file__).resolve().parents[1] / "bot" / "interactions" / "nikki_lines.json"
-LINES = load_ambient_nikki_lines(LINES_PATH)
-assert LINES is not None
-
-
-=======
->>>>>>> Stashed changes
 def settings(**overrides: object) -> AmbientNikkiSettings:
     values: dict[str, object] = {
         "enabled": True,
@@ -55,15 +46,31 @@ def at(hour: int) -> datetime:
 
 
 def test_event_data_has_the_required_pool_sizes_and_core_target_copy() -> None:
-    assert len(PREFIXES) >= 12
-    assert len(GENERAL_TARGET_EVENTS) >= 14
-    assert len(GENERAL_ROOM_EVENTS) >= 16
-    assert len(SLEEP_TARGET_EVENTS) >= 6
-    assert len(SLEEP_ROOM_EVENTS) >= 6
-    assert "偷走了{target}的襪子。" in GENERAL_TARGET_EVENTS
-    assert "朝{target}扔了一顆鑽石。" in GENERAL_TARGET_EVENTS
+    assert len(PREFIXES) >= 20
+    assert len(GENERAL_TARGET_EVENTS) + len(GENERAL_ROOM_EVENTS) >= 40
+    assert len(SLEEP_TARGET_EVENTS) + len(SLEEP_ROOM_EVENTS) >= 15
+    assert "偷走了{target}的襪子" in GENERAL_TARGET_EVENTS
+    assert "朝{target}扔了一顆鑽石" in GENERAL_TARGET_EVENTS
+    assert "把一小袋金幣塞給了{target}" in GENERAL_TARGET_EVENTS
+    assert "替{target}撿到了一枚星光幣" in GENERAL_TARGET_EVENTS
+    assert "留下了一顆鑽石後就跑掉了" in GENERAL_ROOM_EVENTS
+    assert "在地上撒了幾枚星光幣" in GENERAL_ROOM_EVENTS
+    assert "替聊天室掛上了一顆小星星" in GENERAL_ROOM_EVENTS
+    assert "把一隻小熊玩偶放在窗邊" in GENERAL_ROOM_EVENTS
+    all_general_events = (*GENERAL_TARGET_EVENTS, *GENERAL_ROOM_EVENTS)
+    currency_events = tuple(
+        event for event in all_general_events if any(currency in event for currency in ("鑽石", "金幣", "星光幣"))
+    )
+    world_item_events = tuple(
+        event
+        for event in all_general_events
+        if any(item in event for item in ("花", "蝴蝶", "羽毛", "鈕扣", "布料", "緞帶", "星星", "糖果", "茶點", "抱枕", "小熊", "大喵", "針線"))
+    )
+    assert len(currency_events) >= 20
+    assert len(world_item_events) >= 30
     assert set(GENERAL_TARGET_EVENTS).isdisjoint(SLEEP_TARGET_EVENTS)
     assert set(GENERAL_ROOM_EVENTS).isdisjoint(SLEEP_ROOM_EVENTS)
+    assert all(not line.endswith(("。", "！", "!", "…")) for line in (*GENERAL_TARGET_EVENTS, *GENERAL_ROOM_EVENTS, *SLEEP_TARGET_EVENTS, *SLEEP_ROOM_EVENTS))
 
 
 def test_general_skill_can_trigger_from_any_message_content() -> None:
@@ -72,16 +79,16 @@ def test_general_skill_can_trigger_from_any_message_content() -> None:
     assert reason is None
     assert event is not None
     assert event.text.startswith(PREFIXES[0])
-    assert event.text.endswith("偷走了搭配師的襪子。")
+    assert event.text.endswith("偷走了搭配師的襪子")
 
 
 def test_sleep_spell_only_uses_its_rate_between_0200_and_0559() -> None:
     event, reason = service(0.0).decide(guild_id=1, channel_id=100, target="玩家", now=at(2))
     daytime, daytime_reason = service(0.0).decide(guild_id=1, channel_id=100, target="玩家", now=at(6))
 
-    assert reason is None and event is not None and event.text.endswith("看見玩家還醒著，默默抱來了一顆枕頭。")
+    assert reason is None and event is not None and event.text.endswith("替玩家蓋好了棉被")
     assert daytime_reason is None and daytime is not None
-    assert daytime.text.endswith("偷走了玩家的襪子。")
+    assert daytime.text.endswith("偷走了玩家的襪子")
 
 
 def test_night_can_still_trigger_general_skill_when_sleep_check_misses() -> None:
@@ -90,7 +97,7 @@ def test_night_can_still_trigger_general_skill_when_sleep_check_misses() -> None
     )
 
     assert reason is None and event is not None
-    assert event.text.endswith("偷走了玩家的襪子。")
+    assert event.text.endswith("偷走了玩家的襪子")
 
 
 def test_no_skill_is_cast_when_both_independent_chances_miss() -> None:
@@ -135,9 +142,12 @@ def test_rendered_events_are_short_npc_events_without_skill_or_rpg_terms() -> No
     sleep = render_sleep_event("茶米茶", choose=lambda pool: pool[0])
     for text in (general, sleep):
         assert text.startswith(PREFIXES[0])
-        assert len(text.split("\n\n")) == 2
+        assert len(text.split("\n")) == 2
         assert not any(term in text for term in ("【", "】", "使用了", "發動", "技能", "Buff", "Debuff"))
-        assert not re.search(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", text)
+        prefix, event = text.split("\n")
+        assert re.search(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]$", prefix)
+        assert not re.search(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", event)
+        assert not event.endswith(("。", "！", "!", "…"))
     assert "茶米茶" in general
     assert "{target}" not in general
     assert "{target}" not in GENERAL_ROOM_EVENTS[0]
@@ -179,17 +189,11 @@ def test_discord_handler_uses_no_mentions_and_records_after_reply(monkeypatch) -
     monkeypatch.setattr(bot_main, "AMBIENT_NIKKI_SERVICE", ambient)
 
     asyncio.run(bot_main.handle_ambient_nikki_message(message))
-
-<<<<<<< Updated upstream
-    assert message.replies == [("🌸 小暖：這次的套裝也很漂亮呢，搭配師會收下嗎？", False)]
-    assert ambient.daily_counts[(1, datetime.now(TAIPEI_TIMEZONE).date())] == 1
-=======
-    assert "偷走了測試玩家的襪子。" in message.replies[0][0]
+    assert "偷走了測試玩家的襪子" in message.replies[0][0]
     assert "【" not in message.replies[0][0]
     assert message.replies[0][1] is False
     assert message.allowed_mentions is not None
     assert ambient.state.is_cooling_down(1, datetime.now(TAIPEI_TIMEZONE), 30)
->>>>>>> Stashed changes
 
 
 class _FakeMessage:
