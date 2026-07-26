@@ -80,6 +80,7 @@ class DiscordChannelExporter:
                     oldest_timestamp = timestamp
                 record = _to_export_record(
                     message,
+                    channel_id=channel_id,
                     timestamp=timestamp,
                     after=after_boundary,
                     before=before_boundary,
@@ -195,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
 def _to_export_record(
     message: dict[str, Any],
     *,
+    channel_id: int,
     timestamp: datetime | None,
     after: datetime | None,
     before: datetime | None,
@@ -217,6 +219,12 @@ def _to_export_record(
     if not message_id:
         return None
     attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    reference = message.get("message_reference")
+    reply_to_message_id = (
+        str(reference.get("message_id"))
+        if isinstance(reference, dict) and reference.get("message_id") is not None
+        else None
+    )
     return {
         "message_id": message_id,
         "author_id": str(author.get("id") or ""),
@@ -225,6 +233,8 @@ def _to_export_record(
         "content": content,
         "is_bot": bool(author.get("bot", False)),
         "attachment_count": len(attachments),
+        "channel_id": str(channel_id),
+        "reply_to_message_id": reply_to_message_id,
     }
 
 

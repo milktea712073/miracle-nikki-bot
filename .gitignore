@@ -37,6 +37,9 @@ data/facebook_storage_state.json
 data/facebook_browser_profile/
 data/local_exports/
 reports/chat_analysis/
+reports/ambient_trigger_candidates.md
+reports/ambient_reply_candidates.md
+reports/ambient_candidate_data.json
 debug/facebook_feed_diagnostic/
 debug/facebook_detail.*
 

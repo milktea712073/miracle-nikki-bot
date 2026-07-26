@@ -68,6 +68,8 @@ def test_export_paginates_and_excludes_bot_system_and_blank_messages() -> None:
 
     assert [item["message_id"] for item in result.messages] == ["1", "3"]
     assert result.messages[0]["attachment_count"] == 1
+    assert result.messages[0]["channel_id"] == "123"
+    assert result.messages[0]["reply_to_message_id"] is None
     assert result.pages_fetched == 3
     assert session.calls[1]["params"] == {"limit": 100, "before": "2"}
 
@@ -84,6 +86,16 @@ def test_export_retries_429_using_retry_after() -> None:
     assert [item["message_id"] for item in result.messages] == ["1"]
     assert slept == [1.25]
     assert len(session.calls) == 2
+
+
+def test_export_preserves_reply_reference_for_offline_research() -> None:
+    reply = message("2", "2026-01-02T12:00:00Z", "我也想收")
+    reply["message_reference"] = {"message_id": "1"}
+    session = FakeSession([FakeResponse(200, [reply])])
+
+    result = DiscordChannelExporter("token", session=session).export(123, limit=1)
+
+    assert result.messages[0]["reply_to_message_id"] == "1"
 
 
 def test_all_mode_is_mutually_exclusive_with_limit_and_allows_unbounded_export() -> None:
