@@ -1,0 +1,11 @@
+# Used only when --stopwords is supplied. One phrase per line.
+哈哈
+哈哈哈
+就是
+然後
+所以
+這個
+那個
+可以
+沒有
+因為

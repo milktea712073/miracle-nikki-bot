@@ -23,6 +23,13 @@ LINES = load_ambient_nikki_lines(LINES_PATH)
 assert LINES is not None
 
 
+def test_line_file_contains_only_dialogue_without_speaker_prefix() -> None:
+    for category in LINES.categories.values():
+        assert all("小暖：" not in line for line in category.responses)
+        for _requires, responses in category.conditional_responses:
+            assert all("小暖：" not in line for line in responses)
+
+
 def settings(**overrides: object) -> AmbientNikkiSettings:
     values: dict[str, object] = {
         "enabled": True,
@@ -204,7 +211,7 @@ def test_discord_handler_records_only_after_a_successful_reply(monkeypatch) -> N
 
     asyncio.run(bot_main.handle_ambient_nikki_message(message))
 
-    assert message.replies == [("🌸 小暖：這次的套裝也很漂亮呢，搭配師會收下嗎？", False)]
+    assert message.replies == [("🌸 這次的套裝也很漂亮呢，搭配師會收下嗎？", False)]
     assert ambient.daily_counts[(1, datetime.now(TAIPEI_TIMEZONE).date())] == 1
 
 

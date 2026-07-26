@@ -35,6 +35,8 @@ Thumbs.db
 secrets.*
 data/facebook_storage_state.json
 data/facebook_browser_profile/
+data/local_exports/
+reports/chat_analysis/
 debug/facebook_feed_diagnostic/
 debug/facebook_detail.*
 
