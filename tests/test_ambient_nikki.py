@@ -1,186 +1,163 @@
-"""Ambient Xiao Nuan replies are opt-in and safe to test without Discord."""
+"""Ambient Nikki v1 is a low-frequency skill event, not a chat responder."""
 
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import bot.main as bot_main
-from bot.interactions.ambient_nikki import (
-    TAIPEI_TIMEZONE,
-    AmbientNikkiEngine,
-    AmbientNikkiSettings,
-    find_ambient_nikki_match,
-    load_ambient_nikki_lines,
-    normalize_message_text,
+from bot.ambient_nikki import AmbientNikkiService, AmbientNikkiSettings
+from bot.ambient_nikki.service import TAIPEI_TIMEZONE, display_target
+from bot.ambient_nikki.skills import (
+    GENERAL_ROOM_EVENTS,
+    GENERAL_TARGET_EVENTS,
+    PREFIXES,
+    SLEEP_ROOM_EVENTS,
+    SLEEP_TARGET_EVENTS,
+    render_general_event,
+    render_sleep_event,
 )
 
 
+<<<<<<< Updated upstream
 LINES_PATH = Path(__file__).resolve().parents[1] / "bot" / "interactions" / "nikki_lines.json"
 LINES = load_ambient_nikki_lines(LINES_PATH)
 assert LINES is not None
 
 
+=======
+>>>>>>> Stashed changes
 def settings(**overrides: object) -> AmbientNikkiSettings:
     values: dict[str, object] = {
         "enabled": True,
-        "response_chance": 1.0,
-        "cooldown_seconds": 0,
-        "daily_limit": 5,
+        "trigger_rate": 1.0,
+        "sleep_trigger_rate": 1.0,
+        "cooldown_minutes": 30,
         "channel_ids": frozenset({100}),
     }
     values.update(overrides)
     return AmbientNikkiSettings(**values)
 
 
-def engine(**settings_overrides: object) -> AmbientNikkiEngine:
-    return AmbientNikkiEngine(
-        settings(**settings_overrides),
-        LINES,
-        random_value=lambda: 0.0,
-        choose_line=lambda pool: pool[0],
+def service(*random_values: float, **overrides: object) -> AmbientNikkiService:
+    values = iter(random_values or (0.0,))
+    return AmbientNikkiService(
+        settings(**overrides),
+        random_value=lambda: next(values, 0.0),
+        choose_copy=lambda pool: pool[0],
     )
 
 
-def now(hour: int = 12) -> datetime:
+def at(hour: int) -> datetime:
     return datetime(2026, 7, 25, hour, tzinfo=TAIPEI_TIMEZONE)
 
 
-def decide(ambient: AmbientNikkiEngine, content: str, when: datetime | None = None):
-    return ambient.decide(content=content, guild_id=1, channel_id=100, now=when or now())
+def test_event_data_has_the_required_pool_sizes_and_core_target_copy() -> None:
+    assert len(PREFIXES) >= 12
+    assert len(GENERAL_TARGET_EVENTS) >= 14
+    assert len(GENERAL_ROOM_EVENTS) >= 16
+    assert len(SLEEP_TARGET_EVENTS) >= 6
+    assert len(SLEEP_ROOM_EVENTS) >= 6
+    assert "偷走了{target}的襪子。" in GENERAL_TARGET_EVENTS
+    assert "朝{target}扔了一顆鑽石。" in GENERAL_TARGET_EVENTS
+    assert set(GENERAL_TARGET_EVENTS).isdisjoint(SLEEP_TARGET_EVENTS)
+    assert set(GENERAL_ROOM_EVENTS).isdisjoint(SLEEP_ROOM_EVENTS)
 
 
-def test_normalize_message_text_trims_collapses_spaces_and_lowercases_ascii() -> None:
-    assert normalize_message_text("  HELLO   會收嗎  ") == "hello 會收嗎"
+def test_general_skill_can_trigger_from_any_message_content() -> None:
+    event, reason = service(0.0).decide(guild_id=1, channel_id=100, target="搭配師", now=at(12))
+
+    assert reason is None
+    assert event is not None
+    assert event.text.startswith(PREFIXES[0])
+    assert event.text.endswith("偷走了搭配師的襪子。")
 
 
-def test_collect_question_phrase_matches() -> None:
-    match = find_ambient_nikki_match("這次會收嗎", LINES)
+def test_sleep_spell_only_uses_its_rate_between_0200_and_0559() -> None:
+    event, reason = service(0.0).decide(guild_id=1, channel_id=100, target="玩家", now=at(2))
+    daytime, daytime_reason = service(0.0).decide(guild_id=1, channel_id=100, target="玩家", now=at(6))
 
-    assert match is not None
-    assert match.category == "collect_question"
-
-
-def test_collected_phrase_wins_over_shorter_overlapping_phrase() -> None:
-    match = find_ambient_nikki_match("我收完了", LINES)
-
-    assert match is not None
-    assert match.category == "collected"
-    assert match.trigger == "收完了"
+    assert reason is None and event is not None and event.text.endswith("看見玩家還醒著，默默抱來了一顆枕頭。")
+    assert daytime_reason is None and daytime is not None
+    assert daytime.text.endswith("偷走了玩家的襪子。")
 
 
-def test_ordinary_phrase_with_single_collect_character_does_not_match() -> None:
-    assert find_ambient_nikki_match("今天收工了", LINES) is None
-
-
-def test_recharge_phrase_matches() -> None:
-    response = decide(engine(), "這次課多少？")
-
-    assert response is not None
-    assert response.category == "recharge"
-
-
-def test_648_uses_its_exclusive_response_pool() -> None:
-    response = decide(engine(), "這次要不要課 648")
-
-    assert response is not None
-    assert response.line == "648……是很慎重的決定呢。"
-
-
-def test_generic_recharge_phrase_does_not_use_648_line() -> None:
-    response = decide(engine(), "這次課嗎")
-
-    assert response is not None
-    assert response.line != "648……是很慎重的決定呢。"
-
-
-def test_bot_and_non_whitelisted_channel_messages_are_not_considered() -> None:
-    ambient = engine()
-
-    assert not ambient.can_consider(
-        content="會收嗎", guild_id=1, channel_id=100, author_is_bot=True, is_webhook=False, is_system=False
-    )
-    assert not ambient.can_consider(
-        content="會收嗎", guild_id=1, channel_id=999, author_is_bot=False, is_webhook=False, is_system=False
-    )
-    assert not ambient.can_consider(
-        content="會收嗎", guild_id=None, channel_id=100, author_is_bot=False, is_webhook=False, is_system=False
+def test_night_can_still_trigger_general_skill_when_sleep_check_misses() -> None:
+    event, reason = service(0.9, 0.0, sleep_trigger_rate=0.08).decide(
+        guild_id=1, channel_id=100, target="玩家", now=at(5)
     )
 
+    assert reason is None and event is not None
+    assert event.text.endswith("偷走了玩家的襪子。")
 
-def test_probability_miss_does_not_reply() -> None:
-    ambient = AmbientNikkiEngine(
-        settings(response_chance=0.12), LINES, random_value=lambda: 0.12, choose_line=lambda pool: pool[0]
+
+def test_no_skill_is_cast_when_both_independent_chances_miss() -> None:
+    event, reason = service(0.9, 0.9, trigger_rate=0.03, sleep_trigger_rate=0.08).decide(
+        guild_id=1, channel_id=100, target="玩家", now=at(3)
     )
 
-    assert decide(ambient, "會收嗎") is None
+    assert event is None and reason == "probability"
 
 
-def test_decision_reports_non_sensitive_skip_reasons() -> None:
-    ambient = engine(cooldown_seconds=600, daily_limit=1)
-    first = now()
-    ambient.record_success(guild_id=1, now=first)
+def test_guild_cooldown_records_only_after_success() -> None:
+    ambient = service(0.0)
+    now = at(12)
+    event, _ = ambient.decide(guild_id=1, channel_id=100, target="玩家", now=now)
 
-    _response, reason = ambient.decide_with_reason(
-        content="會收嗎", guild_id=1, channel_id=100, now=first + timedelta(seconds=1)
-    )
-    assert reason == "cooldown"
+    assert event is not None
+    ambient.record_success(1, now)
+    blocked, reason = ambient.decide(guild_id=1, channel_id=100, target="玩家", now=now + timedelta(minutes=29))
+    allowed, _ = ambient.decide(guild_id=2, channel_id=100, target="玩家", now=now + timedelta(minutes=1))
 
-    disabled = engine(enabled=False)
-    _response, reason = disabled.decide_with_reason(
-        content="會收嗎", guild_id=1, channel_id=100, now=first
-    )
-    assert reason == "disabled"
+    assert blocked is None and reason == "cooldown"
+    assert allowed is not None
 
 
-def test_global_cooldown_blocks_second_response() -> None:
-    ambient = engine(cooldown_seconds=600)
-    first = now()
-    assert decide(ambient, "會收嗎", first) is not None
-    ambient.record_success(guild_id=1, now=first)
-
-    assert decide(ambient, "復刻了", first + timedelta(seconds=599)) is None
-
-
-def test_daily_limit_resets_using_taipei_date() -> None:
-    ambient = engine(daily_limit=1)
-    first = datetime(2026, 7, 25, 23, 59, tzinfo=TAIPEI_TIMEZONE)
-    assert decide(ambient, "會收嗎", first) is not None
-    ambient.record_success(guild_id=1, now=first)
-
-    assert decide(ambient, "復刻了", first + timedelta(seconds=1)) is None
-    assert decide(ambient, "復刻了", first + timedelta(minutes=2)) is not None
+def test_only_human_allowed_guild_messages_are_eligible() -> None:
+    ambient = service(0.0)
+    assert ambient.skip_reason(guild_id=None, channel_id=100, author_is_bot=False, is_webhook=False, is_system=False) == "direct_message"
+    assert ambient.skip_reason(guild_id=1, channel_id=999, author_is_bot=False, is_webhook=False, is_system=False) == "channel_not_allowed"
+    assert ambient.skip_reason(guild_id=1, channel_id=100, author_is_bot=True, is_webhook=False, is_system=False) == "author_bot"
+    assert ambient.skip_reason(guild_id=1, channel_id=100, author_is_bot=False, is_webhook=True, is_system=False) == "webhook"
+    assert ambient.skip_reason(guild_id=1, channel_id=100, author_is_bot=False, is_webhook=False, is_system=True) == "system_message"
 
 
-def test_feature_defaults_to_disabled_and_invalid_settings_use_safe_defaults(caplog) -> None:
+def test_target_uses_display_name_then_name_without_a_mention() -> None:
+    assert display_target(SimpleNamespace(display_name="芷妤", name="other")) == "芷妤"
+    assert display_target(SimpleNamespace(display_name="", name="Nikki")) == "Nikki"
+    assert display_target(SimpleNamespace()) == "玩家"
+
+
+def test_rendered_events_are_short_npc_events_without_skill_or_rpg_terms() -> None:
+    general = render_general_event("茶米茶", choose=lambda pool: pool[0])
+    sleep = render_sleep_event("茶米茶", choose=lambda pool: pool[0])
+    for text in (general, sleep):
+        assert text.startswith(PREFIXES[0])
+        assert len(text.split("\n\n")) == 2
+        assert not any(term in text for term in ("【", "】", "使用了", "發動", "技能", "Buff", "Debuff"))
+        assert not re.search(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", text)
+    assert "茶米茶" in general
+    assert "{target}" not in general
+    assert "{target}" not in GENERAL_ROOM_EVENTS[0]
+    assert "{target}" not in SLEEP_ROOM_EVENTS[0]
+
+
+def test_settings_default_disabled_and_invalid_values_use_safe_defaults(caplog) -> None:
     defaults = AmbientNikkiSettings.from_environment({})
-    invalid = AmbientNikkiSettings.from_environment(
-        {
-            "ENABLE_AMBIENT_NIKKI": "maybe",
-            "AMBIENT_NIKKI_RESPONSE_CHANCE": "2",
-            "AMBIENT_NIKKI_COOLDOWN_SECONDS": "-1",
-            "AMBIENT_NIKKI_DAILY_LIMIT": "not-a-number",
-            "AMBIENT_NIKKI_CHANNEL_IDS": "bad,100",
-        }
-    )
+    invalid = AmbientNikkiSettings.from_environment({
+        "AMBIENT_NIKKI_ENABLED": "maybe", "AMBIENT_NIKKI_TRIGGER_RATE": "2",
+        "AMBIENT_NIKKI_SLEEP_TRIGGER_RATE": "-1", "AMBIENT_NIKKI_COOLDOWN_MINUTES": "bad",
+        "AMBIENT_NIKKI_CHANNEL_IDS": "bad,100",
+    })
 
-    assert not defaults.enabled
-    assert invalid == AmbientNikkiSettings(False, 0.12, 600, 5, frozenset({100}))
+    assert defaults.enabled is False
+    assert invalid == AmbientNikkiSettings(False, 0.03, 0.08, 30, frozenset({100}))
     assert "invalid" in caplog.text
 
 
-def test_missing_or_invalid_line_file_disables_only_ambient_feature(tmp_path: Path, caplog) -> None:
-    assert load_ambient_nikki_lines(tmp_path / "missing.json") is None
-    invalid = tmp_path / "invalid.json"
-    invalid.write_text("{not json", encoding="utf-8")
-
-    assert load_ambient_nikki_lines(invalid) is None
-    assert "Ambient Nikki is disabled" in caplog.text
-
-
-def test_on_message_keeps_prefix_command_dispatch_when_ambient_handler_returns(monkeypatch) -> None:
+def test_on_message_keeps_prefix_command_dispatch(monkeypatch) -> None:
     calls: list[str] = []
 
     async def fake_ambient(_message) -> None:
@@ -191,35 +168,44 @@ def test_on_message_keeps_prefix_command_dispatch_when_ambient_handler_returns(m
 
     monkeypatch.setattr(bot_main, "handle_ambient_nikki_message", fake_ambient)
     monkeypatch.setattr(bot_main.bot, "process_commands", fake_process_commands)
-
     asyncio.run(bot_main.on_message(SimpleNamespace()))
 
     assert calls == ["ambient", "commands"]
 
 
-def test_discord_handler_records_only_after_a_successful_reply(monkeypatch) -> None:
-    ambient = engine()
+def test_discord_handler_uses_no_mentions_and_records_after_reply(monkeypatch) -> None:
+    ambient = service(0.0)
     message = _FakeMessage()
-    monkeypatch.setattr(bot_main, "AMBIENT_NIKKI_ENGINE", ambient)
+    monkeypatch.setattr(bot_main, "AMBIENT_NIKKI_SERVICE", ambient)
 
     asyncio.run(bot_main.handle_ambient_nikki_message(message))
 
+<<<<<<< Updated upstream
     assert message.replies == [("🌸 小暖：這次的套裝也很漂亮呢，搭配師會收下嗎？", False)]
     assert ambient.daily_counts[(1, datetime.now(TAIPEI_TIMEZONE).date())] == 1
+=======
+    assert "偷走了測試玩家的襪子。" in message.replies[0][0]
+    assert "【" not in message.replies[0][0]
+    assert message.replies[0][1] is False
+    assert message.allowed_mentions is not None
+    assert ambient.state.is_cooling_down(1, datetime.now(TAIPEI_TIMEZONE), 30)
+>>>>>>> Stashed changes
 
 
 class _FakeMessage:
-    content = "會收嗎"
-    author = SimpleNamespace(bot=False)
+    content = "任何聊天內容都不影響技能判定"
+    author = SimpleNamespace(bot=False, display_name="測試玩家", name="fallback")
     guild = SimpleNamespace(id=1)
     channel = SimpleNamespace(id=100)
     webhook_id = None
 
     def __init__(self) -> None:
         self.replies: list[tuple[str, bool]] = []
+        self.allowed_mentions = None
 
     def is_system(self) -> bool:
         return False
 
-    async def reply(self, content: str, *, mention_author: bool) -> None:
+    async def reply(self, content: str, *, mention_author: bool, allowed_mentions) -> None:
         self.replies.append((content, mention_author))
+        self.allowed_mentions = allowed_mentions

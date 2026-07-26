@@ -29,11 +29,8 @@ from announcement.models import Announcement, CN_OFFICIAL, TW_OFFICIAL
 from announcement.search import keyword_search_variants
 from announcement.state_store import AnnouncementStateStore
 from bot.admin.checks import is_administrator, is_administrator_channel
-from bot.interactions.ambient_nikki import (
-    AmbientNikkiEngine,
-    AmbientNikkiSettings,
-    load_ambient_nikki_lines,
-)
+from bot.ambient_nikki import AmbientNikkiService, AmbientNikkiSettings
+from bot.ambient_nikki.service import display_target
 from bot.announcement_search_view import (
     AnnouncementSearchResultView,
     build_announcement_message_payloads,
@@ -156,14 +153,7 @@ DISCORD_COMMAND_PREFIX = os.getenv("DISCORD_COMMAND_PREFIX", "!") or "!"
 DISCORD_MESSAGE_CONTENT_INTENT = load_boolean("DISCORD_MESSAGE_CONTENT_INTENT", default=True)
 ENABLE_ANNOUNCEMENT_PIPELINE = load_boolean("ENABLE_ANNOUNCEMENT_PIPELINE", default=True)
 AMBIENT_NIKKI_SETTINGS = AmbientNikkiSettings.from_environment()
-AMBIENT_NIKKI_LINES = load_ambient_nikki_lines(
-    PROJECT_ROOT / "bot" / "interactions" / "nikki_lines.json"
-)
-AMBIENT_NIKKI_ENGINE = (
-    AmbientNikkiEngine(AMBIENT_NIKKI_SETTINGS, AMBIENT_NIKKI_LINES)
-    if AMBIENT_NIKKI_LINES is not None
-    else None
-)
+AMBIENT_NIKKI_SERVICE = AmbientNikkiService(AMBIENT_NIKKI_SETTINGS)
 
 MAX_AUTO_ANNOUNCEMENTS_PER_CYCLE = 3
 FACEBOOK_POLL_INTERVAL_MINUTES = 5
@@ -682,13 +672,12 @@ bot.tree.remove_command("套裝")
 
 
 async def handle_ambient_nikki_message(message: discord.Message) -> None:
-    """Reply occasionally in opted-in guild channels without affecting commands."""
-    engine = AMBIENT_NIKKI_ENGINE
+    """Occasionally cast a cosmetic skill without interpreting player content."""
+    service = AMBIENT_NIKKI_SERVICE
     author = getattr(message, "author", None)
     guild = getattr(message, "guild", None)
     channel = getattr(message, "channel", None)
-    content = getattr(message, "content", None)
-    if engine is None or author is None or guild is None or channel is None:
+    if author is None or guild is None or channel is None:
         return
     message_type = getattr(message, "type", discord.MessageType.default)
     message_type_name = getattr(message_type, "name", str(message_type))
@@ -697,21 +686,19 @@ async def handle_ambient_nikki_message(message: discord.Message) -> None:
     is_system = bool(getattr(message, "is_system", lambda: False)())
     LOGGER.debug(
         "ambient_nikki received: author_bot=%s webhook_id=%s guild_id=%s channel_id=%s "
-        "message_type=%s content_available=%s enabled=%s allowed_channel_ids=%s",
+        "message_type=%s enabled=%s allowed_channel_ids=%s",
         author_is_bot,
         is_webhook,
         getattr(guild, "id", None),
         getattr(channel, "id", None),
         message_type_name,
-        bool(content and content.strip()),
-        engine.settings.enabled,
-        sorted(engine.settings.channel_ids),
+        service.settings.enabled,
+        sorted(service.settings.channel_ids),
     )
     if message_type != discord.MessageType.default:
         LOGGER.debug("Ambient Nikki skipped: message_type")
         return
-    skip_reason = engine.eligibility_skip_reason(
-        content=content,
+    skip_reason = service.skip_reason(
         guild_id=getattr(guild, "id", None),
         channel_id=getattr(channel, "id", None),
         author_is_bot=author_is_bot,
@@ -724,22 +711,30 @@ async def handle_ambient_nikki_message(message: discord.Message) -> None:
 
     async with ambient_nikki_message_lock:
         now = datetime.now(TAIPEI_TIMEZONE)
-        response, skip_reason = engine.decide_with_reason(
-            content=content,
+        response, skip_reason = service.decide(
             guild_id=guild.id,
             channel_id=channel.id,
+            target=display_target(author),
             now=now,
         )
         if response is None:
             LOGGER.debug("Ambient Nikki skipped: %s", skip_reason)
             return
         try:
+<<<<<<< Updated upstream
             await message.reply(f"🌸 小暖：{response.line}", mention_author=False)
+=======
+            await message.reply(
+                response.text,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+>>>>>>> Stashed changes
         except discord.DiscordException:
             LOGGER.exception("Ambient Nikki reply failed; cooldown and daily count were not recorded.")
             return
-        engine.record_success(guild_id=guild.id, now=now)
-        LOGGER.debug("Ambient Nikki replied: category=%s", response.category)
+        service.record_success(guild_id=guild.id, now=now)
+        LOGGER.debug("Ambient Nikki event sent.")
 
 
 @bot.event
@@ -756,18 +751,15 @@ async def on_message(message: discord.Message) -> None:
 async def on_ready() -> None:
     start_presence_rotation(bot)
     LOGGER.info("%s 已登入 Discord。", bot.user)
-    if AMBIENT_NIKKI_ENGINE is None:
-        LOGGER.info("Ambient Nikki config: disabled because nikki_lines.json could not be loaded.")
-    else:
-        settings = AMBIENT_NIKKI_ENGINE.settings
-        LOGGER.info(
-            "Ambient Nikki config: enabled=%s chance=%s cooldown=%s daily_limit=%s channel_ids=%s",
-            settings.enabled,
-            settings.response_chance,
-            settings.cooldown_seconds,
-            settings.daily_limit,
-            sorted(settings.channel_ids),
-        )
+    settings = AMBIENT_NIKKI_SERVICE.settings
+    LOGGER.info(
+        "Ambient Nikki config: enabled=%s trigger_rate=%s sleep_trigger_rate=%s cooldown_minutes=%s channel_ids=%s",
+        settings.enabled,
+        settings.trigger_rate,
+        settings.sleep_trigger_rate,
+        settings.cooldown_minutes,
+        sorted(settings.channel_ids),
+    )
     if not ENABLE_ANNOUNCEMENT_PIPELINE:
         LOGGER.info("[%s] Official announcement polling and delivery are disabled.", APP_ENV)
         return
