@@ -42,4 +42,18 @@ debug/facebook_detail.*
 work/
 .pytest-tmp*/
 .test-tmp*/
-.pytest-runtime/
+.pytest-runtime*/
+
+# Regenerable local research and diagnostic outputs
+data/local_exports/
+reports/chat_analysis/
+reports/ambient_candidate_data.json
+reports/ambient_reply_candidates.md
+reports/ambient_trigger_candidates.md
+reports/joybomb_draft_report.html
+reports/joybomb_draft_suit_classification.csv
+data/joybomb_archive_index_report.json
+data/joybomb_archive_sample_report.json
+data/joybomb_archive_summary.md
+data/website_crawler_report.json
+data/website_facebook_comparison.json
