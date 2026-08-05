@@ -699,28 +699,26 @@ async def poll_official_announcements() -> None:
             try:
                 announcements = await asyncio.to_thread(crawler, OFFICIAL_POLL_LIMIT)
                 baseline = await asyncio.to_thread(state.get_official_baseline, source)
-                if baseline is None:
+                seen_initialized = await asyncio.to_thread(
+                    state.has_official_seen_announcements,
+                    source,
+                )
+                if not seen_initialized:
                     LOGGER.warning(
-                        "%s baseline is not initialized; no announcements were queued. "
+                        "%s seen state is not initialized; no announcements were queued. "
                         "Run initialize_official_baseline.py first.",
                         label,
                     )
                     continue
-                new_announcements = _announcements_before_official_baseline(announcements, baseline)
-                if new_announcements is None:
-                    LOGGER.warning(
-                        "%s baseline was not found in the fetched official list; "
-                        "no announcements were queued and the baseline was left unchanged "
-                        "source=%s baseline=%s fetched=%s",
-                        label,
-                        source,
-                        baseline,
-                        len(announcements),
+                queued = 0
+                for announcement in _official_announcements_oldest_first(announcements):
+                    registered = await asyncio.to_thread(
+                        state.register_official_if_unseen,
+                        announcement,
+                        channel_ids,
                     )
-                    continue
-                for announcement in reversed(new_announcements):
-                    await asyncio.to_thread(state.register, announcement, channel_ids)
-                if new_announcements:
+                    queued += int(registered)
+                if announcements:
                     await asyncio.to_thread(
                         state.set_official_baseline,
                         source,
@@ -728,7 +726,7 @@ async def poll_official_announcements() -> None:
                     )
                 LOGGER.info(
                     "%s poll completed fetched=%s queued=%s baseline=%s",
-                    label, len(announcements), len(new_announcements), baseline,
+                    label, len(announcements), queued, baseline,
                 )
             except Exception:
                 LOGGER.exception("%s poll failed; other official sources remain available.", label)
@@ -736,20 +734,23 @@ async def poll_official_announcements() -> None:
         official_initial_poll_complete.set()
 
 
-def _announcements_before_official_baseline(
-    announcements: list[Announcement],
-    baseline_external_id: str,
-) -> list[Announcement] | None:
-    """Return latest-first notices before a source-list baseline anchor.
+def _official_announcements_oldest_first(announcements: list[Announcement]) -> list[Announcement]:
+    """Order one official list for delivery without treating IDs as chronology.
 
-    Official article IDs are identifiers, not a reliable chronological sequence.
-    Returning ``None`` distinguishes a missing anchor from a valid empty update
-    and lets the caller fail closed without advancing the baseline.
+    Crawlers return the website's current list order. Publishing timestamps order
+    ordinary cases from oldest to newest; an original list index keeps equal or
+    missing timestamps deterministic without any numeric external-ID comparison.
     """
-    for index, announcement in enumerate(announcements):
-        if announcement.external_id == baseline_external_id:
-            return announcements[:index]
-    return None
+    def sort_key(item: tuple[int, Announcement]) -> tuple[bool, float, int]:
+        index, announcement = item
+        published_at = announcement.published_at
+        if published_at is None:
+            return True, 0.0, index
+        if published_at.tzinfo is None:
+            return False, published_at.replace(tzinfo=TAIPEI_TIMEZONE).timestamp(), index
+        return False, published_at.timestamp(), index
+
+    return [announcement for _, announcement in sorted(enumerate(announcements), key=sort_key)]
 
 
 @tasks.loop(minutes=FACEBOOK_POLL_INTERVAL_MINUTES)

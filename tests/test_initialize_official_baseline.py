@@ -30,14 +30,30 @@ def test_dry_run_plan_does_not_create_announcements_or_deliveries(tmp_path) -> N
     assert not (tmp_path / "announcement_state.db").exists()
 
 
-def test_apply_baseline_persists_only_latest_ids(tmp_path) -> None:
+def test_apply_baseline_persists_latest_ids_and_seeds_seen_window_without_deliveries(tmp_path) -> None:
     store = AnnouncementStateStore(tmp_path / "announcement_state.db")
+    tw_old = notice(TW_OFFICIAL, "17321")
     plan = initialize_official_baseline.OfficialBaselinePlan(
-        (notice(TW_OFFICIAL, "17322"), notice(CN_OFFICIAL, "988690")), False
+        (notice(TW_OFFICIAL, "17322"), tw_old, notice(CN_OFFICIAL, "988690")), False
     )
 
     initialize_official_baseline.apply_plan(store, plan)
 
     assert store.get_official_baseline(TW_OFFICIAL) == "17322"
     assert store.get_official_baseline(CN_OFFICIAL) == "988690"
+    assert store.is_official_announcement_seen(tw_old)
+    assert store.has_official_seen_announcements(TW_OFFICIAL)
+    assert store.has_official_seen_announcements(CN_OFFICIAL)
     assert store.claim_deliveries(10) == []
+
+
+def test_build_plan_reads_the_complete_requested_window() -> None:
+    plan = initialize_official_baseline.build_plan(
+        {
+            TW_OFFICIAL: lambda _limit: [notice(TW_OFFICIAL, "17322"), notice(TW_OFFICIAL, "17321")],
+            CN_OFFICIAL: lambda _limit: [notice(CN_OFFICIAL, "988690"), notice(CN_OFFICIAL, "988689")],
+        },
+        limit=20,
+    )
+
+    assert [item.external_id for item in plan.announcements] == ["17322", "17321", "988690", "988689"]

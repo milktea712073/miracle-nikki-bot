@@ -127,6 +127,16 @@ class AnnouncementStateStore:
                     external_id TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS official_seen_announcements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    canonical_url TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    UNIQUE(source, external_id),
+                    UNIQUE(source, canonical_url)
+                );
                 """
             )
             columns = {
@@ -157,7 +167,12 @@ class AnnouncementStateStore:
             connection.close()
 
     def set_official_baseline(self, source: str, external_id: str) -> None:
-        """Persist one official source's latest known external identifier."""
+        """Persist the latest observed top-list identifier for compatibility diagnostics.
+
+        Discovery is intentionally driven by ``official_seen_announcements`` rather
+        than this single value. Official sites can insert a newly published item
+        anywhere in their list, so an anchor cannot safely bound discovery.
+        """
         connection = self._connect()
         try:
             connection.execute(
@@ -172,6 +187,113 @@ class AnnouncementStateStore:
             connection.commit()
         finally:
             connection.close()
+
+    def has_official_seen_announcements(self, source: str) -> bool:
+        """Return whether an official source has completed its initial seen seed."""
+        connection = self._connect()
+        try:
+            return connection.execute(
+                "SELECT 1 FROM official_seen_announcements WHERE source = ? LIMIT 1", (source,)
+            ).fetchone() is not None
+        finally:
+            connection.close()
+
+    def is_official_announcement_seen(self, announcement: Announcement) -> bool:
+        """Return whether either durable official identity has already been observed."""
+        connection = self._connect()
+        try:
+            return self._is_official_announcement_seen(connection, announcement)
+        finally:
+            connection.close()
+
+    def seed_official_seen_announcements(self, announcements: Iterable[Announcement]) -> int:
+        """Mark a fetched official window as observed without creating deliveries.
+
+        This is used only by explicit baseline initialization. A transaction keeps
+        an interrupted seed from looking complete for part of a source window.
+        """
+        rows = tuple(announcements)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            added = 0
+            for announcement in rows:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO official_seen_announcements (
+                        source, external_id, canonical_url, observed_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        announcement.source,
+                        announcement.external_id,
+                        announcement.canonical_url,
+                        utc_now(),
+                    ),
+                )
+                added += int(cursor.rowcount)
+            connection.commit()
+            return added
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def register_official_if_unseen(
+        self,
+        announcement: Announcement,
+        channel_ids: Iterable[int],
+    ) -> bool:
+        """Persist one new official notice and its seen identity atomically.
+
+        ``True`` means the notice was newly observed and delivery rows were
+        created. Any failure rolls back both the delivery registration and seen
+        marker so a later poll can retry it safely.
+        """
+        channels = tuple(dict.fromkeys(int(channel_id) for channel_id in channel_ids))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            if self._is_official_announcement_seen(connection, announcement):
+                connection.commit()
+                return False
+            self._register_with_connection(connection, announcement, channels)
+            connection.execute(
+                """
+                INSERT INTO official_seen_announcements (
+                    source, external_id, canonical_url, observed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    announcement.source,
+                    announcement.external_id,
+                    announcement.canonical_url,
+                    utc_now(),
+                ),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _is_official_announcement_seen(
+        connection: sqlite3.Connection,
+        announcement: Announcement,
+    ) -> bool:
+        return connection.execute(
+            """
+            SELECT 1
+            FROM official_seen_announcements
+            WHERE source = ? AND (external_id = ? OR canonical_url = ?)
+            LIMIT 1
+            """,
+            (announcement.source, announcement.external_id, announcement.canonical_url),
+        ).fetchone() is not None
 
     def search_announcements(
         self,
@@ -257,80 +379,15 @@ class AnnouncementStateStore:
         pass ``reset_deliveries=True`` to requeue only the supplied channels.
         """
         channels = tuple(dict.fromkeys(int(channel_id) for channel_id in channel_ids))
-        now = utc_now()
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            existing = connection.execute(
-                "SELECT id FROM announcements WHERE source = ? AND (external_id = ? OR canonical_url = ?)",
-                (announcement.source, announcement.external_id, announcement.canonical_url),
-            ).fetchone()
-            if existing is None:
-                cursor = connection.execute(
-                    """
-                    INSERT INTO announcements (
-                        source, external_id, canonical_url, title, category, content_html,
-                        content, image_urls_json, published_at,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        announcement.source,
-                        announcement.external_id,
-                        announcement.canonical_url,
-                        announcement.title,
-                        announcement.category,
-                        announcement.content_html,
-                        announcement.content_text,
-                        json.dumps(announcement.images, ensure_ascii=False),
-                        announcement.published_at.isoformat() if announcement.published_at else None,
-                        now,
-                        now,
-                    ),
-                )
-                announcement_id = int(cursor.lastrowid)
-                connection.executemany(
-                    """
-                    INSERT INTO announcement_deliveries (
-                        announcement_id, channel_id, status, created_at, updated_at
-                    ) VALUES (?, ?, 'pending', ?, ?)
-                    """,
-                    [(announcement_id, channel_id, now, now) for channel_id in channels],
-                )
-            else:
-                announcement_id = int(existing[0])
-                connection.execute(
-                    """
-                    UPDATE announcements
-                    SET canonical_url = ?, title = ?, category = ?, content_html = ?, content = ?,
-                        image_urls_json = ?, published_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        announcement.canonical_url,
-                        announcement.title,
-                        announcement.category,
-                        announcement.content_html,
-                        announcement.content_text,
-                        json.dumps(announcement.images, ensure_ascii=False),
-                        announcement.published_at.isoformat() if announcement.published_at else None,
-                        now,
-                        announcement_id,
-                    ),
-                )
-                if reset_deliveries:
-                    connection.executemany(
-                        """
-                        INSERT INTO announcement_deliveries (
-                            announcement_id, channel_id, status, attempt_count, last_error,
-                            message_ids_json, created_at, updated_at, sent_at
-                        ) VALUES (?, ?, 'pending', 0, NULL, '[]', ?, ?, NULL)
-                        ON CONFLICT(announcement_id, channel_id) DO UPDATE SET
-                            status = 'pending', attempt_count = 0, last_error = NULL,
-                            message_ids_json = '[]', updated_at = excluded.updated_at, sent_at = NULL
-                        """,
-                        [(announcement_id, channel_id, now, now) for channel_id in channels],
-                    )
+            announcement_id = self._register_with_connection(
+                connection,
+                announcement,
+                channels,
+                reset_deliveries=reset_deliveries,
+            )
             connection.commit()
             return announcement_id
         except Exception:
@@ -338,6 +395,89 @@ class AnnouncementStateStore:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _register_with_connection(
+        connection: sqlite3.Connection,
+        announcement: Announcement,
+        channels: tuple[int, ...],
+        *,
+        reset_deliveries: bool = False,
+    ) -> int:
+        """Run ``register``'s database work inside an existing transaction."""
+        now = utc_now()
+        existing = connection.execute(
+            "SELECT id FROM announcements WHERE source = ? AND (external_id = ? OR canonical_url = ?)",
+            (announcement.source, announcement.external_id, announcement.canonical_url),
+        ).fetchone()
+        if existing is None:
+            cursor = connection.execute(
+                """
+                INSERT INTO announcements (
+                    source, external_id, canonical_url, title, category, content_html,
+                    content, image_urls_json, published_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    announcement.source,
+                    announcement.external_id,
+                    announcement.canonical_url,
+                    announcement.title,
+                    announcement.category,
+                    announcement.content_html,
+                    announcement.content_text,
+                    json.dumps(announcement.images, ensure_ascii=False),
+                    announcement.published_at.isoformat() if announcement.published_at else None,
+                    now,
+                    now,
+                ),
+            )
+            announcement_id = int(cursor.lastrowid)
+            connection.executemany(
+                """
+                INSERT INTO announcement_deliveries (
+                    announcement_id, channel_id, status, created_at, updated_at
+                ) VALUES (?, ?, 'pending', ?, ?)
+                """,
+                [(announcement_id, channel_id, now, now) for channel_id in channels],
+            )
+            return announcement_id
+
+        announcement_id = int(existing[0])
+        connection.execute(
+            """
+            UPDATE announcements
+            SET canonical_url = ?, title = ?, category = ?, content_html = ?, content = ?,
+                image_urls_json = ?, published_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                announcement.canonical_url,
+                announcement.title,
+                announcement.category,
+                announcement.content_html,
+                announcement.content_text,
+                json.dumps(announcement.images, ensure_ascii=False),
+                announcement.published_at.isoformat() if announcement.published_at else None,
+                now,
+                announcement_id,
+            ),
+        )
+        if reset_deliveries:
+            connection.executemany(
+                """
+                INSERT INTO announcement_deliveries (
+                    announcement_id, channel_id, status, attempt_count, last_error,
+                    message_ids_json, created_at, updated_at, sent_at
+                ) VALUES (?, ?, 'pending', 0, NULL, '[]', ?, ?, NULL)
+                ON CONFLICT(announcement_id, channel_id) DO UPDATE SET
+                    status = 'pending', attempt_count = 0, last_error = NULL,
+                    message_ids_json = '[]', updated_at = excluded.updated_at, sent_at = NULL
+                """,
+                [(announcement_id, channel_id, now, now) for channel_id in channels],
+            )
+        return announcement_id
 
     def recover_interrupted_deliveries(self) -> int:
         connection = self._connect()

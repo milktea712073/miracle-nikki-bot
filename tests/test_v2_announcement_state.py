@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import bot.main as bot_main
@@ -27,14 +28,20 @@ def announcement(external_id: str = "post-1") -> Announcement:
     )
 
 
-def official_announcement(source: str, external_id: str) -> Announcement:
+def official_announcement(
+    source: str,
+    external_id: str,
+    *,
+    published_at: datetime | None = None,
+    url: str | None = None,
+) -> Announcement:
     return Announcement(
         source=source,
         external_id=external_id,
-        url=f"https://{source}.example/news/{external_id}",
+        url=url or f"https://{source}.example/news/{external_id}",
         title=f"{source} {external_id}",
         category="notice",
-        published_at=None,
+        published_at=published_at,
         content_html=None,
         content_text=external_id,
         images=(),
@@ -202,6 +209,7 @@ def test_official_poller_registers_each_source_once_without_legacy_database(monk
     monkeypatch.setattr(bot_main, "TW_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS", [101])
     monkeypatch.setattr(bot_main, "CN_OFFICIAL_ANNOUNCEMENT_CHANNEL_IDS", [202])
     monkeypatch.setattr(bot_main, "official_initial_poll_complete", asyncio.Event())
+    store.seed_official_seen_announcements((tw_baseline, cn_baseline))
     store.set_official_baseline(TW_OFFICIAL, "1")
     store.set_official_baseline(CN_OFFICIAL, "1")
 
@@ -217,30 +225,41 @@ def test_official_poller_registers_each_source_once_without_legacy_database(monk
     assert store.get_official_baseline(CN_OFFICIAL) == "2"
 
 
-def test_official_poller_uses_list_position_when_cn_external_ids_decrease(monkeypatch, tmp_path: Path) -> None:
+def test_official_poller_finds_unseen_item_after_existing_anchor(monkeypatch, tmp_path: Path) -> None:
     store = AnnouncementStateStore(tmp_path / "announcement_state.db")
-    newest = official_announcement(CN_OFFICIAL, "987984")
-    older_new = official_announcement(CN_OFFICIAL, "987906")
-    baseline = official_announcement(CN_OFFICIAL, "988786")
+    newest = official_announcement(
+        TW_OFFICIAL, "17333", published_at=datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    )
+    seen_anchor = official_announcement(
+        TW_OFFICIAL, "17331", published_at=datetime(2026, 8, 2, 10, 0, tzinfo=timezone.utc)
+    )
+    inserted_after_anchor = official_announcement(
+        TW_OFFICIAL, "17332", published_at=datetime(2026, 8, 2, 3, 30, tzinfo=timezone.utc)
+    )
     configure_official_poller(
         monkeypatch,
         store,
-        tw_announcements=[],
-        cn_announcements=[newest, older_new, baseline],
+        tw_announcements=[newest, seen_anchor, inserted_after_anchor],
+        cn_announcements=[],
     )
-    store.set_official_baseline(CN_OFFICIAL, baseline.external_id)
+    store.seed_official_seen_announcements((seen_anchor,))
+    store.set_official_baseline(TW_OFFICIAL, "17333")
 
     asyncio.run(bot_main.poll_official_announcements.coro())
 
     deliveries = store.claim_deliveries(10)
-    assert [item.announcement.external_id for item in deliveries] == ["987906", "987984"]
-    assert store.get_official_baseline(CN_OFFICIAL) == "987984"
+    assert [item.announcement.external_id for item in deliveries] == ["17332", "17333"]
+    assert store.get_official_baseline(TW_OFFICIAL) == "17333"
 
 
-def test_official_poller_registers_mixed_external_ids_in_official_list_order(monkeypatch, tmp_path: Path) -> None:
+def test_official_poller_uses_publish_time_not_external_id_order(monkeypatch, tmp_path: Path) -> None:
     store = AnnouncementStateStore(tmp_path / "announcement_state.db")
-    newest = official_announcement(TW_OFFICIAL, "7")
-    older_new = official_announcement(TW_OFFICIAL, "999")
+    newest = official_announcement(
+        TW_OFFICIAL, "7", published_at=datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)
+    )
+    older_new = official_announcement(
+        TW_OFFICIAL, "999", published_at=datetime(2026, 8, 2, 7, 0, tzinfo=timezone.utc)
+    )
     baseline = official_announcement(TW_OFFICIAL, "500")
     configure_official_poller(
         monkeypatch,
@@ -248,6 +267,7 @@ def test_official_poller_registers_mixed_external_ids_in_official_list_order(mon
         tw_announcements=[newest, older_new, baseline],
         cn_announcements=[],
     )
+    store.seed_official_seen_announcements((baseline,))
     store.set_official_baseline(TW_OFFICIAL, baseline.external_id)
 
     asyncio.run(bot_main.poll_official_announcements.coro())
@@ -266,6 +286,7 @@ def test_official_poller_does_nothing_when_baseline_is_first(monkeypatch, tmp_pa
         tw_announcements=[baseline, official_announcement(TW_OFFICIAL, "older")],
         cn_announcements=[],
     )
+    store.seed_official_seen_announcements((baseline, official_announcement(TW_OFFICIAL, "older")))
     store.set_official_baseline(TW_OFFICIAL, baseline.external_id)
 
     asyncio.run(bot_main.poll_official_announcements.coro())
@@ -274,7 +295,7 @@ def test_official_poller_does_nothing_when_baseline_is_first(monkeypatch, tmp_pa
     assert store.get_official_baseline(TW_OFFICIAL) == "current"
 
 
-def test_official_poller_fails_closed_when_baseline_is_absent(monkeypatch, tmp_path: Path, caplog) -> None:
+def test_official_poller_fails_closed_until_seen_window_is_initialized(monkeypatch, tmp_path: Path, caplog) -> None:
     store = AnnouncementStateStore(tmp_path / "announcement_state.db")
     configure_official_poller(
         monkeypatch,
@@ -291,7 +312,7 @@ def test_official_poller_fails_closed_when_baseline_is_absent(monkeypatch, tmp_p
 
     assert store.claim_deliveries(10) == []
     assert store.get_official_baseline(CN_OFFICIAL) == "missing-anchor"
-    assert "source=cn_official baseline=missing-anchor fetched=2" in caplog.text
+    assert "CN official seen state is not initialized" in caplog.text
 
 
 def test_official_poller_does_not_call_legacy_sources(monkeypatch, tmp_path: Path) -> None:
@@ -303,6 +324,7 @@ def test_official_poller_does_not_call_legacy_sources(monkeypatch, tmp_path: Pat
         tw_announcements=[baseline],
         cn_announcements=[],
     )
+    store.seed_official_seen_announcements((baseline,))
     store.set_official_baseline(TW_OFFICIAL, baseline.external_id)
 
     def legacy_fetch_must_not_run(_limit: int):
@@ -330,6 +352,65 @@ def test_official_poller_without_baseline_does_not_enqueue_current_notices(monke
     asyncio.run(bot_main.poll_official_announcements.coro())
 
     assert store.claim_deliveries(10) == []
+
+
+def test_official_seen_state_persists_and_isolated_by_source(tmp_path: Path) -> None:
+    path = tmp_path / "announcement_state.db"
+    tw = official_announcement(TW_OFFICIAL, "same-id")
+    cn = official_announcement(CN_OFFICIAL, "same-id")
+    store = AnnouncementStateStore(path)
+
+    store.seed_official_seen_announcements((tw,))
+
+    restarted = AnnouncementStateStore(path)
+    assert restarted.is_official_announcement_seen(tw)
+    assert not restarted.is_official_announcement_seen(cn)
+
+
+def test_register_official_if_unseen_deduplicates_canonical_url_and_creates_one_delivery(tmp_path: Path) -> None:
+    store = AnnouncementStateStore(tmp_path / "announcement_state.db")
+    original = official_announcement(TW_OFFICIAL, "17332", url="https://official.example/news/17332")
+    same_url = official_announcement(TW_OFFICIAL, "alternate-id", url="https://official.example/news/17332")
+
+    assert store.register_official_if_unseen(original, [101])
+    assert not store.register_official_if_unseen(same_url, [101])
+    assert [item.announcement.external_id for item in store.claim_deliveries(10)] == ["17332"]
+
+
+def test_failed_official_registration_does_not_mark_seen(monkeypatch, tmp_path: Path) -> None:
+    store = AnnouncementStateStore(tmp_path / "announcement_state.db")
+    item = official_announcement(TW_OFFICIAL, "17332")
+
+    def fail_register(*_args, **_kwargs) -> int:
+        raise RuntimeError("database write failed")
+
+    monkeypatch.setattr(store, "_register_with_connection", fail_register)
+    try:
+        store.register_official_if_unseen(item, [101])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("registration failure must propagate")
+
+    assert not store.is_official_announcement_seen(item)
+    assert store.claim_deliveries(10) == []
+
+
+def test_upgraded_state_with_only_legacy_anchor_does_not_bulk_queue(monkeypatch, tmp_path: Path) -> None:
+    store = AnnouncementStateStore(tmp_path / "announcement_state.db")
+    current = official_announcement(TW_OFFICIAL, "17333")
+    configure_official_poller(
+        monkeypatch,
+        store,
+        tw_announcements=[current],
+        cn_announcements=[],
+    )
+    store.set_official_baseline(TW_OFFICIAL, "17325")
+
+    asyncio.run(bot_main.poll_official_announcements.coro())
+
+    assert store.claim_deliveries(10) == []
+    assert not store.has_official_seen_announcements(TW_OFFICIAL)
 
 
 def test_v2_worker_marks_each_channel_only_after_that_channel_succeeds(monkeypatch, tmp_path: Path) -> None:
