@@ -10,7 +10,6 @@ from pathlib import Path
 import bot.main as bot_main
 from announcement.models import Announcement, CN_OFFICIAL, TW_FACEBOOK_SOURCE, TW_OFFICIAL
 from announcement.state_store import AnnouncementStateStore
-from crawler.models import Post
 from crawler.website_crawler import WebsiteAnnouncement, WebsiteCrawlResult
 
 
@@ -168,26 +167,9 @@ def test_legacy_initialization_does_not_treat_old_queue_status_as_delivery_evide
     assert plan.legacy_sent == ()
 
 
-def test_tw_poller_writes_only_v2_state(monkeypatch, tmp_path: Path) -> None:
-    state_path = tmp_path / "announcement_state.db"
-    store = AnnouncementStateStore(state_path)
-    post = Post(
-        post_id="v2-post",
-        url="https://www.facebook.com/TwNikkiNikki/posts/v2-post",
-        content="v2 公告",
-        published_at=None,
-        images=[],
-    )
-    monkeypatch.setattr(bot_main, "AnnouncementStateStore", lambda: store)
-    monkeypatch.setattr(bot_main, "get_latest_posts", lambda _limit: [post])
-    monkeypatch.setattr(bot_main, "TW_ANNOUNCEMENT_CHANNEL_IDS", [101])
-    monkeypatch.setattr(bot_main, "tw_initial_poll_complete", asyncio.Event())
-
-    asyncio.run(bot_main.poll_tw_announcements.coro())
-
-    delivery = store.claim_deliveries(1)
-    assert len(delivery) == 1
-    assert delivery[0].announcement.external_id == "v2-post"
+def test_main_does_not_expose_the_retired_facebook_live_poller() -> None:
+    assert not hasattr(bot_main, "poll_tw_announcements")
+    assert not hasattr(bot_main, "poll_facebook_posts")
 
 
 def test_official_poller_registers_each_source_once_without_legacy_database(monkeypatch, tmp_path: Path) -> None:

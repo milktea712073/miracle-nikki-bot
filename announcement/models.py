@@ -7,9 +7,6 @@ from datetime import datetime
 from typing import Mapping
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
-from crawler.models import Post
-
-
 TW_FACEBOOK_SOURCE = "tw_facebook"  # Legacy archive identity only; never polled live.
 TW_OFFICIAL = "tw_official"
 CN_OFFICIAL = "cn_official"
@@ -62,21 +59,6 @@ class Announcement:
     def image_urls(self) -> tuple[str, ...]:
         """Compatibility alias for the legacy dispatcher payload shape."""
         return self.images
-
-    @classmethod
-    def from_facebook_post(cls, post: Post) -> "Announcement":
-        """Create a retained legacy Facebook record without activating its crawler."""
-        return cls(
-            source=TW_FACEBOOK_SOURCE,
-            external_id=post.post_id,
-            url=post.url,
-            title="",
-            category=None,
-            published_at=post.published_at,
-            content_html=None,
-            content_text=post.content,
-            images=tuple(url for url in post.images if isinstance(url, str) and url),
-        )
 
     def payload(self) -> dict[str, object]:
         return {

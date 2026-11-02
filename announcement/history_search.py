@@ -13,7 +13,10 @@ from announcement.models import CN_OFFICIAL, TW_FACEBOOK_SOURCE, TW_OFFICIAL, ca
 from announcement.search import keyword_search_variants
 from announcement.search_models import AnnouncementSearchPage, AnnouncementSearchResult
 from announcement.state_store import AnnouncementStateStore, DEFAULT_STATE_DATABASE_PATH
-from database.database import SQLITE_BUSY_TIMEOUT_MS, SQLITE_TIMEOUT_SECONDS
+
+# Search reads legacy raw-post records but does not need the legacy database module.
+SQLITE_TIMEOUT_SECONDS = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
 TW_REGION = "tw"
