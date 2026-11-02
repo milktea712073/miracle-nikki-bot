@@ -31,6 +31,7 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
+database/backups/
 *.log
 secrets.*
 data/facebook_storage_state.json
